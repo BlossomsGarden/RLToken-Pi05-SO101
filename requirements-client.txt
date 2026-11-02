@@ -1,0 +1,5 @@
+# OpenPI/JAX and GPU-only PyTorch are NOT installed on the Windows robot.
+numpy>=1.26,<3
+Pillow>=10,<13
+opencv-python>=4.9,<5
+openpi-client==0.1.0

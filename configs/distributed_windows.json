@@ -1,0 +1,15 @@
+{
+  "follower_port": "COM5",
+  "leader_port": "COM_LEADER",
+  "follower_id": "so101_follower",
+  "leader_id": "so101_leader",
+  "fps": 30,
+  "cameras": {
+    "front": {"index_or_path": 1, "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG", "warmup_s": 3},
+    "side": {"index_or_path": 0, "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG", "warmup_s": 3}
+  },
+  "max_relative_target": 15.0,
+  "max_leader_alignment_deg": 10.0,
+  "max_tracking_error_deg": [27, 37, 45, 29, 10, 30],
+  "max_command_step_deg": [5, 7, 7.5, 4.5, 1.25, 6.5]
+}

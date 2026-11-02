@@ -1,0 +1,6 @@
+# Use TWO server environments. Install OpenPI checkout commit 15a9616 only
+# in the JAX SFT environment; install the local ./lerobot fork in a separate
+# Python 3.12 PyTorch RL environment. See README.md for exact commands.
+# Installing this file alone does not install JAX, CUDA Torch, or LeRobot.
+numpy>=1.26,<3
+Pillow>=10,<13

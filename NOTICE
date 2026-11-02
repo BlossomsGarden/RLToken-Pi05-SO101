@@ -1,0 +1,16 @@
+RLToken-Pi05-SO101
+
+This repository incorporates the complete modified LeRobot 0.6.2 tree from
+RL-Token-Pi05-open under lerobot/. The upstream LeRobot copyright notices and
+Apache License 2.0 text are preserved in that tree.
+
+The copied RL Token scripts and pi05_rlt implementation originate from
+RL-Token-Pi05-open. The SFT input/output transforms and Windows OpenPI
+deployment client are adapted from So101-Pi0.5-Order-Generalization-main and
+the local SO101 π0.5 deployment workflow. The JAX-to-PyTorch conversion script
+in sft/ is a copy of OpenPI examples/convert_jax_model_to_pytorch.py at
+commit 15a9616, as supplied in the local source tree. Preserve original
+file-level license and attribution notices when redistributing these files.
+
+OpenPI and LeRobot are separate projects. Checkpoint weights, demonstration
+videos, private annotations and third-party datasets are not bundled here.
