@@ -23,6 +23,10 @@ RECORD_FIELDS = [
     "valid_mask", "executed_steps", "collection_phase_id", "success",
     "intervention_flag", "episode_id", "step_id",
 ]
+STATS = {"state_q01": np.zeros(6, dtype=np.float32),
+         "state_q99": np.full(6, 100, dtype=np.float32),
+         "action_q01": np.array([-100] * 5 + [0], dtype=np.float32),
+         "action_q99": np.full(6, 100, dtype=np.float32)}
 
 
 def _make_fixture():
@@ -42,7 +46,7 @@ def test_writes_stride2_windows_with_full_schema():
     out = io.BytesIO()
     n = write_warmup_interval_records(
         out, ep=0, frames_in_interval=list(range(10, 25)),
-        frame_data=frame_data, horizon=10, stride=2, action_dim=6,
+        frame_data=frame_data, horizon=10, stride=2, action_dim=6, **STATS,
     )
     # 15 frames -> windows at pos 0,2,...,14 (8 windows)
     assert n == 8
@@ -58,7 +62,7 @@ def test_writes_stride2_windows_with_full_schema():
 
     for rec in records:
         assert list(rec) == RECORD_FIELDS, list(rec)
-        assert rec["z_rl"].dtype == np.float16 and rec["z_rl"].shape == (4,)
+        assert rec["z_rl"].dtype == np.float32 and rec["z_rl"].shape == (4,)
         assert rec["proprio"].dtype == np.float32 and rec["proprio"].shape == (6,)
         for key in ("ref_chunk", "action_chunk", "next_ref_chunk"):
             assert rec[key].dtype == np.float16 and rec[key].shape == (10, 6)
@@ -77,7 +81,7 @@ def test_window_content_semantics():
     out = io.BytesIO()
     write_warmup_interval_records(
         out, ep=0, frames_in_interval=list(range(10, 25)),
-        frame_data=frame_data, horizon=10, stride=2, action_dim=6,
+        frame_data=frame_data, horizon=10, stride=2, action_dim=6, **STATS,
     )
     out.seek(0)
     records = [pickle.load(out) for _ in range(2)]  # pos 0 (frames 10-19) & pos 2 (12-21)
@@ -85,10 +89,9 @@ def test_window_content_semantics():
     assert r0["executed_steps"] == np.asarray(10, dtype=np.int16)
     assert r0["valid_mask"].all()
     assert r0["step_id"] == np.asarray(10, dtype=np.int32)
-    # first window: next_ref_chunk = frames 20..24 (actions 0.5*frame) then zero padding
-    expected_next = np.full((5, 6), 0.5 * np.arange(20, 25, dtype=np.float32)[:, None],
-                            dtype=np.float16)
-    assert np.allclose(r0["next_ref_chunk"][:5], expected_next)
+    # Next chunk uses its own anchor state (frame 20); gripper remains absolute.
+    assert r0["next_ref_chunk"][0, 0] == np.float16(-.1)
+    assert r0["next_ref_chunk"][0, 5] == np.float16(-.8)
     assert (r0["next_ref_chunk"][5:] == 0).all()
     # z_rl of window start == z of frame 10; next_z_rl == z of the frame right
     # after the window (frame 20 for window 0), clamped to the interval tail
@@ -104,7 +107,7 @@ def test_partial_tail_window_and_action_copy():
     out = io.BytesIO()
     write_warmup_interval_records(
         out, ep=0, frames_in_interval=list(range(10, 25)),
-        frame_data=frame_data, horizon=10, stride=2, action_dim=6,
+        frame_data=frame_data, horizon=10, stride=2, action_dim=6, **STATS,
     )
     out.seek(0)
     records = []
@@ -116,5 +119,6 @@ def test_partial_tail_window_and_action_copy():
     last = records[-1]  # pos 14 -> single frame 24
     assert last["executed_steps"] == np.asarray(1, dtype=np.int16)
     assert last["valid_mask"].sum() == 1
-    # executed action is copied verbatim from frame 24
-    assert np.allclose(last["action_chunk"][0], np.full(6, 12.0, dtype=np.float32))
+    # Arm = action - window-start state; gripper is absolute before normalizing.
+    assert np.allclose(last["action_chunk"][0, :5], [-.12, -.13, -.14, -.15, -.16], atol=1e-4)
+    assert last["action_chunk"][0, 5] == np.float16(-.76)

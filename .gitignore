@@ -9,6 +9,7 @@ __pycache__/
 /checkpoints/
 /outputs/
 /annotation_sheets/
+/annotation_sheets_alignment_30/
 annotations*.json
 *.safetensors
 *.pt
@@ -21,3 +22,5 @@ annotations*.json
 /wandb/
 /data/
 /datasets/
+/rlt_episodes/
+/需要进一步确定.md

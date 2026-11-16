@@ -1,8 +1,6 @@
-"""Shared rlt_core parsers/quantile helpers + eval parse_args smoke.
+"""Shared rlt_core parser and quantile helper tests.
 
-These pure functions gate the camera/limit contract shared by the Stage-2
-trainer and the evaluator, so their behavior is pinned here (previously
-untested duplicated copies lived in both scripts).
+These pure functions validate camera contracts and quantile data.
 """
 import importlib.util
 import sys
@@ -123,36 +121,3 @@ def test_quantile_normalize_guards_zero_range():
     q99 = torch.tensor([5.0])  # degenerate: must not divide by zero
     out = quantile_normalize(torch.tensor([[5.0], [7.0]]), q01, q99)
     assert torch.isfinite(out).all()
-
-
-# ── eval parse_args smoke ───────────────────────────────────────────────────
-
-def _load_eval_module():
-    path = Path(__file__).parents[1] / "scripts" / "eval_rlt_pi05_so101.py"
-    spec = importlib.util.spec_from_file_location("eval_rlt_pi05_so101", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_eval_parse_args_minimal_and_config_file():
-    module = _load_eval_module()
-    argv = ["eval_rlt_pi05_so101.py",
-            "--pi05_path", "p", "--rlt_checkpoint", "c", "--actor_checkpoint", "a",
-            "--task", "t", "--follower_port", "/dev/ttyACM0",
-            "--cameras", '{"top": {"type": "opencv", "index_or_path": 3}}',
-            "--camera_map", '{"top": "observation.images.top"}',
-            "--dry_run"]
-    with mock.patch.object(module.sys, "argv", argv):
-        args = module.parse_args()
-    assert args.dry_run and args.episodes == 10  # parser defaults
-    assert args.camera_map == '{"top": "observation.images.top"}'
-
-    # Real config file path must keep parsing (pure JSON eval config).
-    config_path = Path(__file__).parents[1] / "configs" / "eval_straw_pi05.json"
-    if config_path.is_file():
-        argv2 = ["eval_rlt_pi05_so101.py", "--config", str(config_path), "--dry_run"]
-        with mock.patch.object(module.sys, "argv", argv2):
-            args2 = module.parse_args()
-        assert args2.task  # loaded from the config file
-        assert args2.dry_run

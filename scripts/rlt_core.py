@@ -1,17 +1,7 @@
-"""Shared runtime core for RL-Token-Pi05 online RL (used by both entry points).
+"""RL Token transition schema and Stage 1–4 compatibility helpers.
 
-Byte-identical components extracted from scripts/train_rlt_stage2_pi05.py and
-scripts/eval_rlt_pi05_so101.py, kept here as the single source of truth:
-
-- RerunVisualizationManager          background Rerun visualization thread
-- TransitionSource/Transition/...    boundary snapshots and transition building
-- Pi05ActionCache/LeaderSample/...   action cache and leader sampling
-- ExecutionWindow/BoundaryContext/.. execution windows and takeover state
-- quantile_normalize/_load_json/...  stats loading and quantile normalization
-- parse_camera_map/parse_max_relative_target  config parsing
-
-Any change here affects both entry scripts at once. If log attribution ever
-needs to differ, pass a caller-provided logger instead of the module-level one.
+The online service persists Transition records from this module to its replay
+journal; the data preprocessing scripts use the quantile and camera tools.
 """
 from __future__ import annotations
 
@@ -217,13 +207,13 @@ class Transition:
 
     def to_numpy(self) -> dict[str, np.ndarray]:
         return {
-            "z_rl": _ensure_array(self.z_rl, dtype=np.float16),
+            "z_rl": _ensure_array(self.z_rl, dtype=np.float32),
             "proprio": _ensure_array(self.proprio, dtype=np.float32),
             "ref_chunk": _ensure_array(self.ref_chunk, dtype=np.float16),
             "action_chunk": _ensure_array(self.action_chunk, dtype=np.float16),
             "rewards": _ensure_array(self.rewards, dtype=np.float32),
             "done": _ensure_array(self.done, dtype=np.bool_),
-            "next_z_rl": _ensure_array(self.next_z_rl, dtype=np.float16),
+            "next_z_rl": _ensure_array(self.next_z_rl, dtype=np.float32),
             "next_proprio": _ensure_array(self.next_proprio, dtype=np.float32),
             "next_ref_chunk": _ensure_array(self.next_ref_chunk, dtype=np.float16),
             "source": _ensure_array(self.source, dtype=np.uint8),
@@ -515,6 +505,18 @@ __all__ = [
 ]
 
 
+def openpi_quantiles(path: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Read the SFT checkpoint's state and delta-action statistics."""
+    stats = json.loads(Path(path).read_text(encoding="utf-8"))
+    result = tuple(np.asarray(stats[name][key], dtype=np.float32)
+                   for name in ("state", "actions") for key in ("q01", "q99"))
+    if any(x.shape != (6,) or not np.isfinite(x).all() for x in result):
+        raise ValueError("Expected finite six-joint OpenPI state/actions quantiles")
+    if np.any(result[1] <= result[0]) or np.any(result[3] <= result[2]):
+        raise ValueError("OpenPI quantile ranges must be positive")
+    return result
+
+
 def write_warmup_interval_records(
     out_file,
     ep: int,
@@ -524,47 +526,64 @@ def write_warmup_interval_records(
     horizon: int,
     stride: int,
     action_dim: int,
+    state_q01: np.ndarray,
+    state_q99: np.ndarray,
+    action_q01: np.ndarray,
+    action_q99: np.ndarray,
 ) -> int:
     """Build stride-2 replay windows inside one annotated interval and write warmup
     journal records (pickle stream, schema identical to Stage-2 online transitions
     with ``collection_phase_id=WARMUP``). Shared by ``extract_annotated_warmup.py``
     and ``extract_warmup_from_cache.py``.
 
-    ``frame_data`` maps ``(episode, frame) -> (z_rl fp16, proprio fp32, action fp32)``.
+    ``frame_data`` maps ``(episode, frame) -> (z_rl, raw state degrees, absolute action degrees)``.
     Returns the number of records written.
     """
     f = out_file  # verbatim body below references ``f``
     n_records = 0
+    state_q01, state_q99 = np.asarray(state_q01), np.asarray(state_q99)
+    action_q01, action_q99 = np.asarray(action_q01), np.asarray(action_q99)
+    if any(x.shape != (6,) for x in (state_q01, state_q99, action_q01, action_q99)):
+        raise ValueError("OpenPI state/action quantiles must contain six joints")
+    if np.any(state_q99 <= state_q01) or np.any(action_q99 <= action_q01):
+        raise ValueError("OpenPI quantile ranges must be strictly positive")
+
+    def normalize_degrees(action, anchor):
+        delta = np.asarray(action, dtype=np.float32).copy()
+        delta[:5] -= np.asarray(anchor, dtype=np.float32)[:5]
+        return 2 * (delta - action_q01) / (action_q99 - action_q01) - 1
     for pos in range(0, len(frames_in_interval), stride):
         window_frames = frames_in_interval[pos:pos + horizon]
         if len(window_frames) < 1:
             break
         t0f = window_frames[0]
         t1f = frames_in_interval[min(pos + horizon, len(frames_in_interval) - 1)]
-        z0, p0, _ = frame_data[(ep, t0f)]
-        z1, p1, _ = frame_data[(ep, t1f)]
+        z0, state0, _ = frame_data[(ep, t0f)]
+        z1, state1, _ = frame_data[(ep, t1f)]
+        p0 = 2 * (np.asarray(state0) - state_q01) / (state_q99 - state_q01) - 1
+        p1 = 2 * (np.asarray(state1) - state_q01) / (state_q99 - state_q01) - 1
 
         action_chunk = np.zeros((horizon, action_dim), dtype=np.float32)
         next_ref_chunk = np.zeros((horizon, action_dim), dtype=np.float32)
         valid_mask = np.zeros(horizon, dtype=np.bool_)
         executed = 0
         for i, fr in enumerate(window_frames):
-            action_chunk[i] = frame_data[(ep, fr)][2]
+            action_chunk[i] = normalize_degrees(frame_data[(ep, fr)][2], state0)
             valid_mask[i] = True
             executed += 1
         # next window's demo actions as next_ref_chunk (may be all-zero padding)
         next_frames = frames_in_interval[pos + horizon:pos + 2 * horizon]
         for i, fr in enumerate(next_frames):
-            next_ref_chunk[i] = frame_data[(ep, fr)][2]
+            next_ref_chunk[i] = normalize_degrees(frame_data[(ep, fr)][2], state1)
 
         record = {
-            "z_rl": z0.astype(np.float16),
+            "z_rl": z0.astype(np.float32),
             "proprio": p0.astype(np.float32),
             "ref_chunk": action_chunk.astype(np.float16),
             "action_chunk": action_chunk.astype(np.float16),
             "rewards": np.zeros(horizon, dtype=np.float32),
             "done": np.asarray(False, dtype=np.bool_),
-            "next_z_rl": z1.astype(np.float16),
+            "next_z_rl": z1.astype(np.float32),
             "next_proprio": p1.astype(np.float32),
             "next_ref_chunk": next_ref_chunk.astype(np.float16),
             "source": np.asarray(TransitionSource.BASE, dtype=np.uint8),

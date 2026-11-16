@@ -1,0 +1,16 @@
+{
+  "mode": "train",
+  "host": "127.0.0.1",
+  "port": 6016,
+  "pi05_checkpoint": "checkpoints/pi05_lerobot_pretrained",
+  "openpi_norm_stats": "checkpoints/pi05_norm_stats.json",
+  "joint_mapping_file": "configs/joint_mapping.json",
+  "require_nonidentity_mapping": true,
+  "encoder_checkpoint": "outputs/rlt_stage1/best_checkpoint.pt",
+  "critical_classifier": "outputs/critical_classifier.pt",
+  "warmup_journal": null,
+  "resume_checkpoint": null,
+  "actor_checkpoint": null,
+  "output": "outputs/rlt_online",
+  "fixed_noise_seed": 0
+}

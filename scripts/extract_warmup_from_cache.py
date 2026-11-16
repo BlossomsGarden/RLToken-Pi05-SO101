@@ -15,7 +15,8 @@ Usage:
         --cache_path outputs/pi05_embeddings \
         --rlt_checkpoint outputs/rlt_stage1/best_checkpoint.pt \
         --annotations annotations.json \
-        --dataset_path /path/to/my_dataset \
+        --dataset_path datasets/red_green \
+        --norm-stats checkpoints/pi05_norm_stats.json \
         --output warmup_replay_journal.pkl \
         --device cuda:2
 """
@@ -37,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from rlt_core import quantile_normalize, write_warmup_interval_records  # noqa: E402
+from rlt_core import openpi_quantiles, write_warmup_interval_records  # noqa: E402
 
 
 def load_annotations(path: str | Path) -> dict[int, list[tuple[int, int]]]:
@@ -60,6 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--annotations", type=str, required=True)
     parser.add_argument("--dataset_path", type=str, required=True,
                         help="Dataset dir (only the data parquet is read for state/action).")
+    parser.add_argument("--norm-stats", type=Path, required=True,
+                        help="OpenPI SFT checkpoint stats.json (state and delta actions)")
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--horizon", type=int, default=10)
     parser.add_argument("--stride", type=int, default=2)
@@ -72,18 +75,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    stats_path = Path(args.dataset_path) / "meta" / "stats.json"
-    stats = json.loads(stats_path.read_text(encoding="utf-8"))
-    state_lo, state_hi = (
-        torch.as_tensor(stats["observation.state"][key], dtype=torch.float32)
-        for key in ("q01", "q99")
-    )
-    action_lo, action_hi = (
-        torch.as_tensor(stats["action"][key], dtype=torch.float32)
-        for key in ("q01", "q99")
-    )
-    if any(t.shape != (6,) for t in (state_lo, state_hi, action_lo, action_hi)):
-        raise ValueError("Stage 2 warmup expects six-dimensional absolute dataset quantiles")
+    quantiles = openpi_quantiles(args.norm_stats)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     annotations = load_annotations(args.annotations)
     if not annotations:
@@ -161,13 +153,9 @@ def main() -> None:
         z_np = z_rl.detach().cpu().numpy().astype(np.float16)
         for offset, (ep, frame, cache_idx) in enumerate(batch_rows):
             r = df_indexed.loc[cache_idx]
-            proprio = quantile_normalize(
-                torch.as_tensor(np.asarray(r["observation.state"], dtype=np.float32)), state_lo, state_hi,
-            )[:args.state_dim].numpy()
-            action = quantile_normalize(
-                torch.as_tensor(np.asarray(r["action"], dtype=np.float32)), action_lo, action_hi,
-            )[:args.action_dim].numpy()
-            frame_data[(ep, frame)] = (z_np[offset], proprio, action)
+            frame_data[(ep, frame)] = (z_np[offset],
+                                       np.asarray(r["observation.state"], dtype=np.float32),
+                                       np.asarray(r["action"], dtype=np.float32))
         logger.info("z_rl batch %d/%d (%.1fs elapsed)",
                     start // args.batch_size + 1,
                     (len(rows) + args.batch_size - 1) // args.batch_size,
@@ -188,6 +176,8 @@ def main() -> None:
                 n_records += write_warmup_interval_records(
                     f, ep, frames_in_interval, frame_data,
                     horizon=horizon, stride=stride, action_dim=action_dim,
+                    state_q01=quantiles[0], state_q99=quantiles[1],
+                    action_q01=quantiles[2], action_q99=quantiles[3],
                 )
 
     logger.info("Saved %d warmup replay transitions to %s", n_records, out_path)

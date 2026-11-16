@@ -11,7 +11,7 @@ Purpose:
 Compatible command shape:
     python -m sft.serve_policy_fixed_noise \
       --config pi05_so101_pickplace_v3 \
-      --checkpoint-dir /path/to/checkpoint \
+      --checkpoint-dir checkpoints/pi05_20k \
       --port 6006 \
       --noise-seed 0
 """
@@ -32,6 +32,9 @@ from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
 from openpi.training import config as _config
 from sft.so101_config import register
+from rlt_online.joint_mapping import JointMapping
+from pathlib import Path
+import json
 
 
 FRONT_JPEG_KEY = "transport/front_image_jpeg"
@@ -53,11 +56,14 @@ class FixedNoiseJpegPolicy:
         action_horizon: int,
         action_dim: int,
         noise_seed: int,
+        mapping: JointMapping | None = None,
     ) -> None:
         self._policy = policy
         self._action_horizon = int(action_horizon)
         self._action_dim = int(action_dim)
         self._noise_seed = int(noise_seed)
+        self._mapping = mapping
+        self._requests = 0
 
         rng = np.random.default_rng(self._noise_seed)
         self._noise = rng.standard_normal(
@@ -72,6 +78,7 @@ class FixedNoiseJpegPolicy:
             "sampling": "fixed_noise",
             "noise_seed": self._noise_seed,
             "noise_shape": [self._action_horizon, self._action_dim],
+            "joint_mapping": mapping is not None,
         }
 
     @property
@@ -91,18 +98,29 @@ class FixedNoiseJpegPolicy:
         side = decode_rgb_jpeg(obs[SIDE_JPEG_KEY])
         jpeg_decode_ms = (time.perf_counter() - decode_start) * 1000.0
 
+        state_client = np.asarray(obs["observation/state"], dtype=np.float32)
+        if state_client.shape != (6,):
+            raise ValueError("Expected six client joint angles")
+        state_model = self._mapping.to_model(state_client) if self._mapping else state_client
         policy_obs = {
             "observation/front_image": front,
             "observation/side_image": side,
-            "observation/state": np.asarray(
-                obs["observation/state"],
-                dtype=np.float32,
-            ),
+            "observation/state": state_model,
             "prompt": obs["prompt"],
         }
 
         # Important: same exact noise tensor for every request.
         result = self._policy.infer(policy_obs, noise=self._noise)
+        if self._mapping is not None:
+            actions_model = np.asarray(result["actions"], dtype=np.float32)
+            if actions_model.shape != (self._action_horizon, 6):
+                raise ValueError("Mapped model actions must be horizon x six joints")
+            result["actions"] = self._mapping.to_physical(actions_model)
+        self._requests += 1
+        if self._mapping is not None and (self._requests <= 3 or self._requests % 100 == 0):
+            logging.info("Joint mapping request %d: client=%s model=%s action_client_first=%s",
+                         self._requests, state_client.tolist(), state_model.tolist(),
+                         np.asarray(result["actions"])[0].tolist())
 
         total_ms = (time.perf_counter() - start) * 1000.0
         result["server_timing"] = {
@@ -146,6 +164,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=6006)
     parser.add_argument("--noise-seed", type=int, default=0)
     parser.add_argument("--default-prompt", default=None)
+    parser.add_argument("--new-so101", action="store_true",
+                        help="Apply verified client-to-model joint mapping")
+    parser.add_argument("--mapping-file", type=Path, default=None)
     return parser
 
 
@@ -155,6 +176,8 @@ def main() -> None:
     register()
     training_config = _config.get_config(args.config)
     action_horizon, action_dim = resolve_model_shape(training_config)
+    if (action_horizon, action_dim) != (50, 32):
+        raise ValueError("This SO-101 checkpoint requires fixed noise shape (50,32)")
 
     logging.info(
         "Loading policy config=%s checkpoint=%s",
@@ -167,12 +190,20 @@ def main() -> None:
         args.checkpoint_dir,
         default_prompt=args.default_prompt,
     )
+    mapping = None
+    if args.new_so101:
+        if args.mapping_file is None:
+            raise ValueError("--new-so101 requires --mapping-file with measured offsets")
+        mapping = JointMapping(json.loads(args.mapping_file.read_text(encoding="utf-8")))
+        if np.allclose(mapping.scale, 1) and np.allclose(mapping.offset, 0):
+            raise ValueError("Refusing identity placeholder for --new-so101 mapping")
 
     wrapped = FixedNoiseJpegPolicy(
         policy,
         action_horizon=action_horizon,
         action_dim=action_dim,
         noise_seed=args.noise_seed,
+        mapping=mapping,
     )
 
     hostname = socket.gethostname()

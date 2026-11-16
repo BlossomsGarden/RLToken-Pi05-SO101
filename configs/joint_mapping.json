@@ -1,0 +1,5 @@
+{
+  "joint_names": ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"],
+  "scale": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+  "offset": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+}

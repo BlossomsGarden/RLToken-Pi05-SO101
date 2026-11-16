@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--precomputed_zrl", type=str, default=None,
                         help="NPZ from precompute_critical_zrl.py (dataset evaluation).")
     parser.add_argument("--record_path", type=str, default=None,
-                        help="Live 'c'-boundary log from train_rlt_stage2_pi05.py "
+                        help="Annotated critical-boundary pickle log "
                              "(evaluate on REAL robot data; mutually exclusive-ish with precomputed_zrl).")
     parser.add_argument("--classifier", type=str, required=True)
     parser.add_argument("--val_episodes", type=int, default=3,

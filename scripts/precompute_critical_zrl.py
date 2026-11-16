@@ -18,7 +18,7 @@ Usage:
         --pi05_path ./pi05_base \
         --tokenizer_path ./paligemma_tokenizer \
         --rlt_checkpoint ../outputs/pi05_rlt_stage1/best_checkpoint.pt \
-        --dataset_path /path/to/my_dataset_multitask \
+        --dataset_path datasets/red_green \
         --annotations annotations.json \
         --output outputs/critical_zrl.npz \
         --batch_size 8 --device cuda
@@ -161,7 +161,8 @@ def main() -> None:
     t0 = time.time()
     for start in range(0, len(samples), args.batch_size):
         batch_meta = samples[start:start + args.batch_size]
-        processed = [process_frame(dataset[global_idx]) for global_idx, _ in batch_meta]
+        raw_frames = [dataset[global_idx] for global_idx, _ in batch_meta]
+        processed = [process_frame(frame) for frame in raw_frames]
         batch = {
             k: torch.utils.data.default_collate([item[k] for item in processed])
             if isinstance(processed[0][k], torch.Tensor) else [item[k] for item in processed]
@@ -199,7 +200,7 @@ def main() -> None:
         end = start + bsize
         z_rl_out[start:end] = z_rl.detach().cpu().numpy().astype(np.float16)
         for offset, (global_idx, label) in enumerate(batch_meta):
-            proprio_out[start + offset] = dataset[global_idx]["observation.state"].numpy().astype(np.float32)
+            proprio_out[start + offset] = np.asarray(raw_frames[offset]["observation.state"], dtype=np.float32)
             labels_out[start + offset] = label
             episode_out[start + offset] = episode_ids[global_idx]
             frame_out[start + offset] = frame_ids[global_idx]

@@ -4,3 +4,5 @@
 # Installing this file alone does not install JAX, CUDA Torch, or LeRobot.
 numpy>=1.26,<3
 Pillow>=10,<13
+msgpack>=1.0,<2
+websockets>=14,<18

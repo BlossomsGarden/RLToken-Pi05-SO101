@@ -6,19 +6,19 @@ interval of the dataset, computes z_rl for each frame with the frozen π0.5 +
 Stage-1 RLT encoder (same code path as precompute_critical_zrl.py), and writes
 Stage-2 replay journal records (pickle stream) tagged as collection_phase=warmup.
 
-Stage 2 then loads the journal with --restore_replay, so the learner's warmup
-batches (warmup_demo_ratio=0.3) are drawn from the operator's annotated key
-phases instead of only online-collected episodes.
+    An explicitly configured journal can initialize replay; online training
+    starts with an empty journal by default.
 
 Replay window semantics match the online loop: stride=2, horizon=10
 (n_action_steps_rl), source=BASE, rewards=0, done=False.
 
 Usage:
     python scripts/extract_annotated_warmup.py \
-        --dataset_path /path/to/my_dataset \
+        --dataset_path datasets/red_green \
         --annotations annotations.json \
-        --pi05_path /path/to/pi05/pretrained_model \
-        --tokenizer_path /path/to/paligemma_tokenizer \
+        --pi05_path checkpoints/pi05_lerobot_pretrained \
+        --norm-stats checkpoints/pi05_norm_stats.json \
+        --tokenizer_path checkpoints/tokenizer \
         --rlt_checkpoint outputs/rlt_stage1/best_checkpoint.pt \
         --output warmup_replay_journal.pkl \
         --device cuda
@@ -43,7 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from train_critical_classifier import load_annotations  # noqa: E402
 
-from rlt_core import quantile_normalize, write_warmup_interval_records  # noqa: E402
+from rlt_core import openpi_quantiles, write_warmup_interval_records  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_path", type=str, required=True)
     parser.add_argument("--annotations", type=str, required=True)
     parser.add_argument("--pi05_path", type=str, required=True)
+    parser.add_argument("--norm-stats", type=Path, required=True,
+                        help="OpenPI SFT checkpoint stats.json (state and delta actions)")
     parser.add_argument("--tokenizer_path", type=str, required=True)
     parser.add_argument("--rlt_checkpoint", type=str, required=True)
     parser.add_argument("--output", type=str, required=True,
@@ -105,14 +107,7 @@ def main() -> None:
 
     dataset_path = Path(args.dataset_path)
     dataset = LeRobotDataset(dataset_path.name, root=dataset_path, video_backend="pyav")
-    # The SFT model uses DELTA-action stats, but Stage 2 replay contains
-    # absolute joint targets normalized with the original dataset stats.
-    state_stats = dataset.meta.stats["observation.state"]
-    action_stats = dataset.meta.stats["action"]
-    state_lo, state_hi = (torch.as_tensor(state_stats[key], dtype=torch.float32) for key in ("q01", "q99"))
-    action_lo, action_hi = (torch.as_tensor(action_stats[key], dtype=torch.float32) for key in ("q01", "q99"))
-    if any(t.shape != (6,) for t in (state_lo, state_hi, action_lo, action_hi)):
-        raise ValueError("Stage 2 warmup expects six-dimensional absolute dataset quantiles")
+    quantiles = openpi_quantiles(args.norm_stats)
 
     def _to_dict_features(features):
         from lerobot.configs.types import PolicyFeature
@@ -131,7 +126,8 @@ def main() -> None:
 
     preprocessor, _ = make_pi05_pre_post_processors(
         config=pi05_config,
-        dataset_stats=dataset.meta.stats,
+        dataset_stats={"observation.state": {"q01": quantiles[0], "q99": quantiles[1]},
+                       "action": {"q01": quantiles[2], "q99": quantiles[3]}},
     )
     if hasattr(preprocessor, "steps"):
         preprocessor.steps = [
@@ -222,16 +218,10 @@ def main() -> None:
 
         for offset, (global_idx, ep, frame) in enumerate(batch_rows):
             raw = raw_rows[offset]
-            proprio = quantile_normalize(
-                torch.as_tensor(raw["observation.state"], dtype=torch.float32), state_lo, state_hi,
-            )[:args.state_dim].numpy()
-            act = quantile_normalize(
-                torch.as_tensor(raw["action"], dtype=torch.float32), action_lo, action_hi,
-            )[:args.action_dim].numpy()
             frame_data[(ep, frame)] = (
                 z_rl[offset].detach().cpu().numpy().astype(np.float16),
-                proprio,
-                act,
+                np.asarray(raw["observation.state"], dtype=np.float32),
+                np.asarray(raw["action"], dtype=np.float32),
             )
         logger.info("z_rl batch %d/%d done (%.1fs elapsed)",
                     start // args.batch_size + 1,
@@ -253,6 +243,8 @@ def main() -> None:
                 n_records += write_warmup_interval_records(
                     f, ep, frames_in_interval, frame_data,
                     horizon=horizon, stride=stride, action_dim=action_dim,
+                    state_q01=quantiles[0], state_q99=quantiles[1],
+                    action_q01=quantiles[2], action_q99=quantiles[3],
                 )
 
     logger.info("Saved %d warmup replay transitions to %s", n_records, out_path)

@@ -11,7 +11,7 @@ Safety:
 - Real motion requires --execute.
 - Safety is split into command-rate limiting and a tracking-error watchdog.
 
-Key addition in v2:
+Execution controls:
 - The model returns the configured 50-step action chunk.
 - --execute-horizon controls how many leading actions are actually executed
   before switching to a newly inferred chunk.
@@ -37,6 +37,8 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+from sft.camera_env import camera_setting
+
 
 MOTOR_NAMES = (
     "shoulder_pan",
@@ -58,7 +60,11 @@ def load_env_file(path: Path) -> dict[str, str]:
     if not path.is_file():
         return values
 
-    for raw_line in path.read_text().splitlines():
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except UnicodeDecodeError:
+        lines = path.read_text(encoding="gbk").splitlines()
+    for raw_line in lines:
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -167,6 +173,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--no-calibration", action="store_true")
+    parser.add_argument("--rebase-delta", action="store_true",
+                        help="Re-anchor the first five joints of asynchronous prefetched chunks")
 
     return parser
 
@@ -624,6 +632,8 @@ def main() -> None:
         raise SystemExit("--prefetch-after must be >= 1")
     if args.prefetch_after > args.execute_horizon:
         raise SystemExit("--prefetch-after cannot exceed --execute-horizon")
+    if args.rebase_delta and args.prefetch_after >= args.execute_horizon:
+        raise SystemExit("--rebase-delta requires asynchronous prefetch before the chunk ends")
     if args.max_boundary_wait <= 0:
         raise SystemExit("--max-boundary-wait must be positive")
     command_step_limits = np.asarray(args.command_step_limits, dtype=np.float32)
@@ -637,8 +647,14 @@ def main() -> None:
 
     follower_port = env_value(env, "FOLLOWER_PORT")
     follower_id = env_value(env, "FOLLOWER_ID")
-    front_camera = env_value(env, "FRONT_CAMERA")
-    side_camera = env_value(env, "SIDE_CAMERA")
+    _, front_camera = camera_setting(
+        {name: env_value(env, name) for name in ("FRONT_CAMERA", "CAM_FRONT")},
+        "FRONT_CAMERA", "CAM_FRONT",
+    )
+    _, side_camera = camera_setting(
+        {name: env_value(env, name) for name in ("SIDE_CAMERA", "CAM_SIDE")},
+        "SIDE_CAMERA", "CAM_SIDE",
+    )
     calibration_root = env_value(env, "HF_LEROBOT_CALIBRATION")
 
     task = args.task or env_value(env, "TASK_DESCRIPTION")
@@ -652,8 +668,8 @@ def main() -> None:
     required = {
         "FOLLOWER_PORT": follower_port,
         "FOLLOWER_ID": follower_id,
-        "FRONT_CAMERA": front_camera,
-        "SIDE_CAMERA": side_camera,
+        "FRONT_CAMERA or CAM_FRONT": front_camera,
+        "SIDE_CAMERA or CAM_SIDE": side_camera,
         "TASK_DESCRIPTION or --task": task,
     }
     missing = [name for name, value in required.items() if not value]
@@ -722,7 +738,7 @@ def main() -> None:
     print(f"Execute horizon: {args.execute_horizon}")
     print(f"Resample steps: {args.resample_steps}")
     print(f"Prefetch after action: {args.prefetch_after}")
-    print("Async delta-action rebase: DISABLED")
+    print(f"Async delta-action rebase: {args.rebase_delta}")
     print("Command-step limits:")
     for motor, limit in zip(MOTOR_NAMES, command_step_limits, strict=True):
         print(f"  {motor:<16} {float(limit):.3f}")
@@ -823,7 +839,7 @@ def main() -> None:
         # normal current is usually low; sustained 180+ raw
         # appeared when the gripper was mechanically blocked.
         # ====================================================
-        SAFE_GRIPPER_MIN = 18.5
+        SAFE_GRIPPER_MIN = 5.0
 
         GRIP_CURRENT_TRIGGER = 180
         GRIP_CURRENT_CONSECUTIVE = 2
@@ -1223,14 +1239,9 @@ def main() -> None:
             )
             execution_state = read_present_position(robot)
 
-            # IMPORTANT:
-            # DeltaActions during training encode each future target relative to
-            # the observation state, not as an incremental action-to-action delta.
-            # The server's AbsoluteActions already reconstructs the correct absolute
-            # targets using that observation state. Do NOT rebase the whole chunk to
-            # the later execution state, because that double-counts motion already
-            # made while the request was in flight.
-            current_actions = raw_next_actions.copy()
+            current_actions = (rebase_delta_trained_actions(raw_next_actions, inference_state,
+                                                             execution_state)
+                               if args.rebase_delta else raw_next_actions.copy())
 
             describe_inference(next_message, current_actions)
 
@@ -1239,7 +1250,7 @@ def main() -> None:
             print(np.round(stale_shift, 3))
             if previous_command is not None:
                 raw_jump = current_actions[0] - previous_command
-                print("Boundary first-action jump (NO REBASE):")
+                print("Boundary first-action jump:")
                 print(np.round(raw_jump, 3))
 
             print(f"Boundary wait: {boundary_wait_ms:.1f} ms")

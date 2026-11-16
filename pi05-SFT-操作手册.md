@@ -1,11 +1,15 @@
-# **pi05-SFT-操作手册**
+# 🧪 π0.5 SFT 操作手册
+
+从 **120 集、四种颜色指令**的 SO-101 双摄数据出发，完成 π0.5 全参数 SFT，并在 Windows 真机与 Linux GPU 服务器间部署 20k step checkpoint。五阶段路线见 [总 README](README.md)；RLToken 在线环节见 [RLT 操作手册](RLT-操作手册.md)。
+
+## 🗺️ 模型分布式部署
 
 ```text
 ┌──────────────────────────────────────────────────────────────┐
 │ 本地主机：Windows                                             │
-│ So101-Pi0.5-Ball-For-Real + LeRobot 0.6.0                    │
+│ SO-101 + LeRobot 0.6.0 / LeLab .venv                         │
 │                                                              │
-│ 真机双相机图像 + SO101 从臂 6DoF 关节状态 + 任务指令            │
+│ 真机双相机图像 + SO-101 从臂 6 维状态 + 任务指令               │
 │                         ↓                                    │
 │ 观测采集 → RGB / JPEG 编码 → OpenPI WebSocket 客户端           │
 │                                      ↑                       │
@@ -13,7 +17,7 @@
 │                                      ↓                       │
 │                    时效 / 范围 / 关节限速 / 跟踪误差检查        │
 │                                      ↓                       │
-│                       LeRobot → USB 串口 → SO101 从臂         │
+│                       LeRobot → USB 串口 → SO-101 从臂        │
 │                                                              │
 │ 无硬件测试：合成图像与状态 → 同一客户端 → 模拟执行器             │
 └────────────────────┬────────────────────▲────────────────────┘
@@ -21,136 +25,133 @@
                      │ JPEG 双相机         │ H50×6 动作序列
                      │ 6 维状态 / 指令     │ 推理耗时
                      ▼                    │
-           SSH 本地端口转发：127.0.0.1:16006 -> 服务器端口 127.0.0.1:6006
+           SSH 本地转发：127.0.0.1:6006 → 服务器 127.0.0.1:6006
                      │                    ▲
-                     │                    |
                      │ WebSocket / MessagePack
                      ▼                    │
 ┌──────────────────────────────────────────────────────────────┐
-│ 远程服务器：Linux（4xH200）                                   │
-│ conda环境 w JAX + OpenPI commit 15a9616 + OpenPI π0.5 权重    │
-| 127.0.0.1:6006 使用定制化的 serve_policy_fixed_noise.py       |
+│ 远程服务器：Linux（训练 4×H200；部署时加载 SFT checkpoint）   │
+│ OpenPI JAX 环境 / π0.5 / serve_policy_fixed_noise.py          │
 │                                                              │
-│ JPEG 解码 → SO101 输入转换 / 归一化 → GPU 模型推理             │
+│ JPEG 解码 → SO-101 输入转换 / 归一化 → GPU 模型推理             │
 │                                      ↓                       │
 │                  反归一化 / 恢复绝对目标 → 返回 H50×6 动作     │
 │                                                              │
-│ checkpoint: ou05_so101_pickplace_v3 20k step                 │
+│ checkpoint：红块叠绿块等四种组合的 SFT 20k step              │
 │ 模型调用链不经过 ROS2 / MuJoCo 容器                            │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-## Preparation
-
-- 🤗 [Portable Lelab GUI](https://huggingface.co/datasets/BlossomsGarden/pick-and-place-v3_20261025_051506/resolve/main/lelab-portable-win64.zip)
-- 🤗 Dataset: [BlossomsGarden/pick-and-place-v3\_20261025\_051506](https://huggingface.co/datasets/BlossomsGarden/pick-and-place-v3_20261025_051506)
-- ☁️ Base Model (OpenPI-pi0.5):
-```powershell
-gsutil -m  cp -r   gs://openpi-assets/checkpoints/pi05_base/params   D:\google-cloud-cli\download
-```
-
 ## ⚗️ 环境配方
 
-- 服务器端训练推理：`requirements-ssh.txt`
-- 本机对接控臂：Lelab GUI 现成环境(.venv) + `requirements-client.txt`
-
+- 🖥️ 服务器 SFT：沿用原有 **OpenPI JAX** 环境、训练权重和原 checkpoint；安装本仓库的 [requirements-ssh.txt](requirements-ssh.txt)。RLToken 的 PyTorch 环境另行使用，见 [RLT 手册](RLT-操作手册.md)。
+- 🦾 Windows：沿用 LeLab GUI 的 `.venv` 环境，安装 [requirements-client.txt](requirements-client.txt)；本仓库根目录下的 `deploy_openpi.py`、`test_so101_inference.py`、`check_camera.py`、`sft/` 等文件保持相对目录结构。
+- 📦 数据：`BlossomsGarden/pick-and-place-v3_20261025_051506`，共 120 集、四种颜色组合；基础模型为 OpenPI `pi05_base`。私有数据、SFT checkpoint 与原训练脚本不包含在本仓库。
+- 🔧 标定：从臂使用与采集时对应的标定；换臂时先核实 `configs/joint_mapping.json` 和真实关节/夹爪安全边界。
 
 ## 🧪 SFT 配方
 
-4*H200 DP 每卡batch=4，global=16，num_workers=8，AdamW(clip_norm=1.0)，lr 2.5e-5，warmup 1000至 2.5e-6
-全量微调，连Paligamma的llm和img都调了
-EMA 0.999 也是全参数
-动作空间为前5关节输出delta，夹爪gripper输出绝对值。动作频率与相机对齐，30fps
-delta所使用的基准来自模型生成chunk的那个观测的observation.state（施加RTC使用execute-horizon=15,--prefetch-after=5的话那么参考的基准大概就是5~15之间的某帧的状态吧）
-q01/q99动作归一化，外置相机->base_0_rgb、腕部相机->left_wrist_0_rgb、全0mask->right_wrist相机
-相机图片从640x480等比缩放到168x224，然后上下各pad 28行黑边到224x224，保持30fps
+以下是**原训练机记录的训练设置**；仓库内的 `sft/so101_config.py` 注册了配方、`sft/openpi_entry.py` 提供训练入口。原训练环境实际启动命令与私有权重还需在服务器核对。
 
-每 10kstep 约4h26min，显存占用约110G
+| 模块 | 实际使用配置 |
+| --- | --- |
+| 计算与优化 | 4×H200 数据并行；每卡 batch 4、global batch 16；workers 8；AdamW、梯度裁剪 `1.0`；warmup 1000 步升至峰值 `2.5e-5`，按当前配方在 20k steps 内 cosine 衰减至 `2.5e-6` |
+| 可训练参数 | **全参数微调**：视觉与 PaliGemma 语言部分也参与；EMA `0.999` 覆盖全参数 |
+| 动作 | 前五关节为相对**生成该 chunk 时观测 state** 的 delta；夹爪是绝对目标；动作与相机对齐至 30 fps；q01/q99 归一化 |
+| 相机 | 外置视角 → `base_0_rgb`；腕部视角 → `left_wrist_0_rgb`；`right_wrist_0_rgb` 的 mask 全 0；原始 640×480 等比缩放至 168×224，再上下各补 28 行黑边至 224×224 |
+| 训练记录 | 每 10k steps 约 4 小时 26 分钟；显存约 110 GB（原训练机记录，非本仓库复测） |
 
+**20k checkpoint** 是后续 Stage 3/4/5 冻结使用的 SFT 基础；10k 仅是训练耗时统计的单位，当前仓库没有可核验的 10k SFT 性能对照。Stage 3 的编码器训练、Stage 4 分类器训练与 SFT 全参数训练是不同步骤。
 
+训练配置名为 `pi05_so101_pickplace_v3`，配方见 [sft/so101_config.py](sft/so101_config.py)；[sft/openpi_entry.py](sft/openpi_entry.py) 负责在原 OpenPI 环境注册配置后调用其训练和统计脚本。训练所得归一化统计要与选用的 20k checkpoint **同源**，不能用原 LeRobot 数据集的绝对动作 q01/q99 代替 delta 动作统计。原机具体多卡启动命令请参阅 [待确认清单](需要进一步确定.md)。
 
-## 👩‍🔬 Inference
+## 👩‍🔬 分离式推理
 
+### 1️⃣ 服务器启动 6006
 
-pytorch fp32 22G 184ms，
-此处使用 jax fp16 8.8G 85ms,
-总时延大概120ms左右，相机记录与编码、读关节信息这些 10ms，SSH隧道传输约 20ms，服务器端解码然后推理85ms，再发回控制信息5ms
-
-是否太慢？
-不慢吧，主要是看它一次生成50步动作，30fps也就是1.67s，100ms只有10%不到，RTC秒了
-不过实际上确实是有一卡一卡的，但是检查的时候说是内部的settle策略，要连续4次检测运动小于0.5°才算停止才会开始抓拍（不然糊掉了）和下一个chunk推理
-
-### 服务器侧：启动推理服务
+在原 OpenPI 环境和本仓库根目录运行；按原服务器实际目录设置以下**相对路径或环境变量**：
 
 ```bash
-
-bash serve_so101.sh 6006
-python test_so101_inference.py --port 6006 --prompt "Pick up the red block and place it on top of the green block."
-# 预期：actions shape (50,6), SMOKE TEST PASSED, 稳态 ~100-150ms/请求
+export OPENPI_ROOT=../openpi
+export SFT_CHECKPOINT_DIR=checkpoints/pi05_20k
+# 更换 SO-101 且映射经真机核验时才设置：
+# export NEW_SO101=1
+# export MAPPING_FILE=configs/joint_mapping.json
+bash sft/serve_so101.sh 6006
 ```
 
+另开终端，从仓库根目录做**无机械臂**请求测试（服务只监听回环）：
 
-### Windows侧
+```bash
+python test_so101_inference.py --host 127.0.0.1 --port 6006 --prompt "Pick up the red block and place it on top of the green block."
+# 预期：SMOKE TEST PASSED，返回有限值的 (50, 6) 动作
+```
 
-SSH 隧道（必须时刻保持开启状态）
+### 2️⃣ Windows 建立 SSH 隧道
+
+先在 **工作区根目录**运行网络预检，然后打开隧道；`SSH_PORT`、`SSH_HOST`、`SSH_KEY` 在当前 PowerShell 会话中自行设置，**不要写入仓库**。隧道需一直保持开启。
 
 ```powershell
-ssh -p xxx  -L 9000:127.0.0.1:9000 -L 6006:127.0.0.1:6006  root@xx.xx.xx.xx  -i  C:\xx\id_ed25519
+Push-Location ../..
+powershell.exe -NoProfile -File .\Ensure-IWanRemote.ps1 -Connect
+Pop-Location
+ssh -p $env:SSH_PORT -L 9000:127.0.0.1:9000 -L 6006:127.0.0.1:6006 "root@$env:SSH_HOST" -i $env:SSH_KEY
 ```
 
-机械臂标定文件最好保持和数据集收集时的标定文件相同，随后编辑 .env 文件
-```
-# SO101 真机部署 Windows 环境模板
+通过 `http://localhost:9000/windows/` 下载 Windows 运行文件；保持 `sft/`、顶层入口及依赖目录的相对结构。从**本仓库根目录**继续：
 
-# ---- 机械臂（设备管理器确认 COM 号） ----
+```powershell
+python test_so101_inference.py --host 127.0.0.1 --port 6006
+```
+
+### 3️⃣ 编辑 `.env` 并核对双摄
+
+在根目录参考 [sft/.env.example](sft/.env.example)。端口、相机索引仅为示意，标定路径需按项目目录调整；不要把私人绝对路径或密钥提交到仓库：
+
+```dotenv
 FOLLOWER_PORT=COM5
 FOLLOWER_ID=so101
-# ps: 此处是 .cache\huggingface\lerobot\calibration\robots\so_follower 底下的 json 文件的文件名
-
-# ---- 双摄（OpenCV 索引；一定确保是否写反ID） ----
 FRONT_CAMERA=1
 SIDE_CAMERA=0
 CAMERA_WIDTH=640
 CAMERA_HEIGHT=480
 FPS=30
-
-# ---- lelab 标定目录 ----
-HF_LEROBOT_CALIBRATION=D:/2026offer/so101/sources/lelab-main/.cache/huggingface/lerobot/calibration
-
-# ---- 任务指令（后续启动时还可以通过命令行参数覆写） ----
+HF_LEROBOT_CALIBRATION=../sources/lelab-main/.cache/huggingface/lerobot/calibration
 TASK_DESCRIPTION=Pick up the red block and place it on top of the green block.
-
-# ---- 推理服务（SSH 隧道后的本地回环地址） ----
 OPENPI_HOST=127.0.0.1
 OPENPI_PORT=6006
-OPENPI_API_KEY=（空着）
-
+OPENPI_API_KEY=
 ```
 
-确认相机 ID 没有标错
+`FOLLOWER_ID` 是 `calibration/robots/so_follower/` 下对应 JSON 文件的**不含扩展名**文件名。客户端也接受旧命名 `CAM_FRONT`／`CAM_SIDE`；同一视角两种名称同时设置时必须相同，否则拒绝启动。
+
 ```powershell
-python check_cameras.py
+python check_camera.py
+# 在当前目录生成 front.png、side.png；检查打印的索引与视角是否对应
 ```
 
+特别核实 `front` 是否是 SFT 对应的外置视角、`side` 是否是训练时腕部视角，**不要仅凭相机编号猜测**。
 
-确认机械臂起始位姿
+### 4️⃣ 先 dry-run，再执行
+
 ```powershell
-# 数据集 120 episodes 首帧 6 关节均值为 [-3, -103, 93, 55, 0, 0]
-python deploy_openpi.py --no-calibration --jpeg-quality 90 --steps 1 --execute-horizon 50 --prefetch-after 50  --fps 30
+python deploy_openpi.py --no-calibration --jpeg-quality 90 --steps 1 --execute-horizon 50 --prefetch-after 50 --fps 30
 ```
 
+不带 `--execute`：采集图像与状态、请求动作、检查输出，但不发送运动命令。原 120 集首帧六维均值 `[-3, -103, 93, 55, 0, 0]` 仅供比对，当前臂标定与起始位姿仍需实机检查。
 
-实机执行
 ```powershell
-# 完整 H50
-python deploy_openpi.py --no-calibration --jpeg-quality 90 --steps 2000 --execute-horizon 50 --prefetch-after 50  --fps 30 --execute  --task "Pick up the red block and place it on top of the green block."
+# 完整 50/50：执行整块后停稳、重新观测
+python deploy_openpi.py --no-calibration --jpeg-quality 90 --steps 1500 --execute-horizon 50 --prefetch-after 50 --fps 30 --execute --task "Pick up the red block and place it on top of the green block"
 
-# RTC 
-python deploy_openpi.py --no-calibration --jpeg-quality 90 --steps 2000 --execute-horizon 15 --prefetch-after 5  --fps 30 --execute  --task "Pick up the red block and place it on top of the green block."
+# 异步 RTC：执行 25 步，在第 15 步提前采样下一观测；前五轴重新锚定
+python deploy_openpi.py --no-calibration --jpeg-quality 90 --steps 1500 --execute-horizon 25 --prefetch-after 15 --fps 30 --rebase-delta --execute --task "Pick up the red block and place it on top of the green block"
 ```
 
+可按运行需要把 `--steps` 改为 2000；15/5 也是可试的 RTC 地平线／提前采样组合。异步预取下，前五轴 delta 以**发起那次请求时的观测 state** 为基准；`--rebase-delta` 才在执行下一段前按执行时 state 重锚定，夹爪绝对值不重锚定。
 
-### Demo & 推理速度
+## ⏱️ 性能记录与排查
 
-TODO
-
+- 用户提供的原机记录：PyTorch fp32 约 22 GB／184 ms；JAX fp16 约 8.8 GB／85 ms；相机读数/编码约 10 ms、网络估计约 20 ms、返回动作约 5 ms，合计约 120 ms。**这些并非本仓库或当前隧道复测值**。
+- 50 步、30 fps 的一块覆盖约 1.67 s；整体停顿还受 `settle` 影响。现有 SFT 客户端在下一次抓拍前要求连续 **4 次**、每次间隔约 **50 ms** 的关节运动不超过 0.5°；实际端到端时间需看日志和真机测量。
+- 机械臂发生跟踪误差、夹爪打滑或镜头错位时，停止执行并复核安全阈值、标定和映射。现有疑问及需补测的数值见 [需要进一步确定](需要进一步确定.md)。

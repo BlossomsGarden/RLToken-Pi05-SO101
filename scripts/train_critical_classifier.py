@@ -7,9 +7,7 @@ Data sources (can be mixed):
      The npz already contains balanced positive/negative samples (positive =
      inside the operator's annotated intervals; negative = unmarked frames of
      annotated episodes only, so unannotated episodes never leak labels).
-  2. Live 'c'-boundary log (optional supplement):
-       --record_path <train_rlt_stage2_pi05.py --critical_record_path output>
-     z_rl/proprio samples with manual 'c' toggle events expanded into labels.
+  2. Optional preexisting human boundary-log samples with critical toggles.
 
 Usage:
     python scripts/train_critical_classifier.py \
@@ -44,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--precomputed_zrl", type=str, default=None,
                         help="NPZ from precompute_critical_zrl.py (primary source).")
     parser.add_argument("--record_path", type=str, default=None,
-                        help="Live 'c'-boundary log from train_rlt_stage2_pi05.py (optional supplement).")
+                        help="Optional annotated critical-boundary pickle log.")
     parser.add_argument("--output", type=str, required=True,
                         help="Checkpoint output path (.pt).")
     parser.add_argument("--epochs", type=int, default=30)

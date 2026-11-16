@@ -1,37 +1,8 @@
 #!/usr/bin/env python3
-"""Interactive critical-phase annotation tool for a LeRobot teleop dataset.
+"""Label one placement-alignment span in each red-on-green episode (0–29).
 
-Decodes the dataset's videos with PyAV (handles AV1/libsvtav1, which OpenCV's
-VideoCapture often cannot). Two annotation modes, auto-selected:
-
-1. GUI mode (default when a display is present; tkinter, no OpenCV GUI needed):
-    plays all available camera videos and marks intervals with the keyboard:
-       s        mark interval START at the current frame
-       e        mark interval END at the current frame (appends [start, end])
-       u        undo the last interval
-       space    pause / resume
-       left/right   step one frame (auto-pause)
-       Shift+left/right   jump ±30 frames
-       n        skip to the next episode
-       q        save annotations and quit
-2. Contact-sheet mode (automatic fallback for headless/remote sessions):
-   renders each episode into a montage PNG (thumbnail per frame with its frame
-   number) into --sheet_dir, then collects intervals interactively on the
-   terminal:
-       100 300   add interval [100, 300]
-       undo      remove the last interval
-       skip      skip this episode (nothing saved)
-       (blank)   finish this episode, continue with the next
-       quit      save annotations and exit
-
-Annotations are saved as JSON with inclusive, episode-local frame indices
-(LeRobot frame_index semantics, 0-based per episode). The file is incremental:
-already-annotated episodes are skipped, new intervals are appended.
-
-Usage:
-    python scripts/annotate_dataset.py \
-        --dataset_path /path/to/my_dataset \
-        --annotations_out annotations.json
+Renders numbered front-camera thumbnails and incrementally saves inclusive,
+zero-based episode-local frame intervals in an annotations JSON file.
 """
 from __future__ import annotations
 
@@ -51,20 +22,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset_path", type=str, required=True)
     parser.add_argument("--annotations_out", type=str, required=True,
-                        help="JSON output path (incremental: existing intervals are kept).")
-    parser.add_argument("--camera", type=str, default=None,
-                        help="Camera used for contact-sheet mode (defaults to top, front, or first available); "
-                             "GUI mode shows all cameras side by side.")
+                        help="JSON output path (incremental: annotated episodes are skipped).")
+    parser.add_argument("--camera", type=str, default="observation.images.front")
     parser.add_argument("--fps", type=float, default=30.0,
                         help="Dataset frame rate (used to compute episode offsets in shared videos).")
-    parser.add_argument("--force_sheet", action="store_true",
-                        help="Force contact-sheet mode even if a display is available.")
-    parser.add_argument("--sheet_dir", type=str, default="annotation_sheets",
-                        help="Directory for contact-sheet PNGs (headless mode).")
-    parser.add_argument("--sheet_cols", type=int, default=12,
-                        help="Thumbnails per row in contact sheets.")
-    parser.add_argument("--thumb_width", type=int, default=160,
-                        help="Thumbnail width in contact sheets.")
+    parser.add_argument("--sheet_dir", type=str, default="annotation_sheets_alignment_30",
+                        help="Directory for numbered front-camera contact sheets.")
     return parser.parse_args()
 
 
@@ -73,11 +36,14 @@ def load_existing(path: Path) -> dict[int, list[tuple[int, int]]]:
         return {}
     with open(path, encoding="utf-8") as file:
         data = json.load(file)
+    if not isinstance(data.get("annotations"), list):
+        raise ValueError("Annotation JSON must contain an annotations list")
     annotations: dict[int, list[tuple[int, int]]] = {}
     for item in data.get("annotations", []):
-        annotations.setdefault(int(item["episode"]), []).append(
-            (int(item["start"]), int(item["end"]))
-        )
+        episode, start, end = (int(item[key]) for key in ("episode", "start", "end"))
+        if episode not in range(30) or episode in annotations or not 0 <= start <= end:
+            raise ValueError(f"Invalid or duplicated red-on-green annotation for episode {episode}")
+        annotations[episode] = [(start, end)]
     return annotations
 
 
@@ -89,6 +55,7 @@ def save_annotations(path: Path, annotations: dict[int, list[tuple[int, int]]]) 
             for start, end in annotations[episode]
         ]
     }
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
     with open(tmp, "w", encoding="utf-8") as file:
         json.dump(payload, file, indent=2)
@@ -135,6 +102,8 @@ def episode_video_paths(
     result: list[tuple[int, dict[str, tuple[Path, int]], int]] = []
     for row in episodes:
         episode_index = int(row["episode_index"])
+        if episode_index not in range(30):
+            continue
         length = int(row["length"])
         paths: dict[str, tuple[Path, int]] = {}
         for cam in cameras:
@@ -180,11 +149,10 @@ def iter_episode_frames(video_path: Path, start_frame: int, length: int, fps: fl
     _seek_to_frame(container, stream, max(0, start_frame - 10), fps)
     try:
         for frame in container.decode(stream):
-            if frame.pts is not None:
-                seconds = float(frame.pts * stream.time_base)
-                frame_no = int(round(seconds * fps))
-            else:
-                frame_no = -1  # unknown; caller falls back to counting
+            if frame.pts is None:
+                raise ValueError(f"Video frame has no timestamp: {video_path}")
+            seconds = float(frame.pts * stream.time_base)
+            frame_no = int(round(seconds * fps))
             if frame_no >= start_frame + length:
                 break
             if frame_no >= start_frame:
@@ -192,263 +160,6 @@ def iter_episode_frames(video_path: Path, start_frame: int, length: int, fps: fl
     finally:
         container.close()
 
-
-class EpisodeFrameReader:
-    """Random-access frame reader for one episode's video segment (PyAV).
-
-    Sequential playback decodes forward without reopening; jumps (backward or
-    far forward) reopen the container and seek, so pausing and ±30-frame
-    stepping stay fast.
-    """
-
-    def __init__(self, video_path: Path, start_frame: int, length: int, fps: float):
-        self._video_path = str(video_path)
-        self._start_frame = start_frame
-        self._length = length
-        self._fps = fps
-        self._container = None
-        self._stream = None
-        self._decoder = None
-        self._current_frame = -1  # last frame index handed out (video-global)
-        self._last_image = None   # cached ndarray of _current_frame (for repeated reads)
-
-    def _open(self, episode_frame: int) -> None:
-        import av
-
-        if self._container is not None:
-            self._container.close()
-        self._container = av.open(self._video_path)
-        self._stream = self._container.streams.video[0]
-        _seek_to_frame(
-            self._container, self._stream, max(0, self._start_frame + episode_frame - 10), self._fps,
-        )
-        self._decoder = self._container.decode(self._stream)
-        self._current_frame = self._start_frame + episode_frame - 11
-        self._last_image = None
-
-    def read(self, episode_frame: int):
-        """Return bgr24 ndarray for the episode-local frame, or None past the end."""
-        target = self._start_frame + episode_frame
-        if target < 0 or target >= self._start_frame + self._length:
-            return None
-        if (
-            self._container is None
-            or target < self._current_frame
-            or target - self._current_frame > 90
-        ):
-            self._open(episode_frame)
-        frame = None
-        while self._current_frame < target:
-            try:
-                frame = next(self._decoder)
-            except StopIteration:
-                return None
-            if frame.pts is not None:
-                frame_no = int(round(float(frame.pts * self._stream.time_base) * self._fps))
-            else:
-                frame_no = self._current_frame + 1
-            self._current_frame = frame_no
-        if self._current_frame == target:
-            if frame is None:
-                # Repeated read of the current frame (GUI tick + keypress both
-                # refresh the same frame): the decoder already handed it out on
-                # the first call, so serve the cached image.
-                return self._last_image
-            self._last_image = frame.to_ndarray(format="bgr24")
-            return self._last_image
-        return None
-
-    def close(self) -> None:
-        if self._container is not None:
-            self._container.close()
-            self._container = None
-
-
-def gui_available() -> bool:
-    """Tkinter-based GUI works whenever a display is present (no OpenCV GUI needed)."""
-    try:
-        import tkinter as tk
-
-        root = tk.Tk()
-        root.destroy()
-        return True
-    except Exception:
-        return False
-
-
-class _TkAnnotator:
-    """tkinter playback window showing every camera side by side.
-
-    Keys: space pause, s/e intervals, u undo, ←/→ step frames,
-    Shift+←/→ jump ±30, n next episode, q quit.
-    """
-
-    DISPLAY_W = 480   # displayed width per camera (source 640x480)
-    DISPLAY_H = 360
-
-    def __init__(self, readers: dict[str, EpisodeFrameReader], episode: int, length: int):
-        import tkinter as tk
-
-        from PIL import Image, ImageTk
-
-        self.readers = readers
-        self.cameras = list(readers.keys())
-        self.episode = episode
-        self.length = length
-        self.frame = 0
-        self.paused = False
-        self.start_mark: int | None = None
-        self.intervals: list[tuple[int, int]] = []
-        self.quit_all = False
-        self._photos: dict[str, ImageTk.PhotoImage] = {}
-        self._Image = Image
-        self._ImageTk = ImageTk
-
-        n_cameras = max(1, len(self.cameras))
-        width = n_cameras * self.DISPLAY_W
-        height = self.DISPLAY_H + 24
-        self.root = tk.Tk()
-        self.root.title(
-            f"annotate episode {episode} | cameras: {', '.join(self.cameras)} "
-            f"(s=start e=end u=undo space=pause ←/→=frame Shift+←/→=±30 n=next q=quit)"
-        )
-        self.canvas = tk.Canvas(self.root, width=width, height=height, bg="black")
-        self.canvas.pack()
-        self.status = tk.Label(self.root, text="", font=("TkDefaultFont", 12), anchor="w")
-        self.status.pack(fill="x")
-        self.root.bind("<KeyPress>", self._on_key)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._show_frame()
-        self.root.after(30, self._tick)
-
-    def _show_frame(self) -> None:
-        self.canvas.delete("all")
-        for index, camera in enumerate(self.cameras):
-            x0 = index * self.DISPLAY_W
-            reader = self.readers[camera]
-            bgr = reader.read(self.frame)
-            if bgr is None:
-                self.canvas.create_text(
-                    x0 + self.DISPLAY_W // 2, self.DISPLAY_H // 2,
-                    text=f"{camera}: no frame", fill="#888888",
-                )
-            else:
-                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                image = self._Image.fromarray(rgb).resize(
-                    (self.DISPLAY_W, self.DISPLAY_H), self._Image.BILINEAR,
-                )
-                self._photos[camera] = self._ImageTk.PhotoImage(image)
-                self.canvas.create_image(x0, 0, anchor="nw", image=self._photos[camera])
-                for start, end in self.intervals:
-                    if start <= self.frame <= end:
-                        color = "#ff6666" if self.start_mark is None else "#ffcc66"
-                        self.canvas.create_rectangle(
-                            x0 + 2, 2, x0 + self.DISPLAY_W - 2, self.DISPLAY_H - 2,
-                            outline=color, width=6,
-                        )
-                        break
-                if self.start_mark is not None and self.frame >= self.start_mark:
-                    self.canvas.create_rectangle(
-                        x0 + 2, 2, x0 + self.DISPLAY_W - 2, self.DISPLAY_H - 2,
-                        outline="#66ff66", width=3,
-                    )
-            self.canvas.create_text(
-                x0 + 8, self.DISPLAY_H + 4, anchor="nw",
-                text=camera.replace("observation.images.", ""),
-                fill="#ffffff", font=("TkDefaultFont", 10),
-            )
-        status = "PAUSED" if self.paused else "PLAYING"
-        self.status.config(
-            text=f"ep {self.episode}  frame {self.frame}/{self.length}  [{status}]  "
-                 f"intervals: {self.intervals}  (n = next episode, q = quit, "
-                 f"auto-advances at the last frame)"
-        )
-
-    def _tick(self) -> None:
-        if not self.paused and self.frame + 1 < self.length:
-            self.frame += 1
-            self._show_frame()
-            self.root.after(30, self._tick)
-        elif not self.paused:
-            # Playback reached the last frame: auto-save and move to the next
-            # episode (the main loop persists any marked intervals).
-            print(f"  [ep {self.episode}] end of episode reached; moving to next episode")
-            self.root.destroy()
-        else:
-            self.root.after(30, self._tick)
-
-    def _on_key(self, event) -> None:
-        key = event.keysym.lower()
-        if key in ("q", "escape"):
-            self.quit_all = True
-            self.root.destroy()
-        elif key == "space":
-            self.paused = not self.paused
-            self._show_frame()
-        elif key == "n":
-            self.root.destroy()
-        elif key == "s":
-            self.start_mark = self.frame
-            print(f"  [ep {self.episode}] interval START at frame {self.frame}")
-            self._show_frame()
-        elif key == "e":
-            if self.start_mark is None:
-                print(f"  [ep {self.episode}] press 's' before 'e'")
-            else:
-                end_frame = max(self.start_mark, self.frame)
-                self.intervals.append((self.start_mark, end_frame))
-                print(f"  [ep {self.episode}] interval END at frame {self.frame} -> "
-                      f"[{self.start_mark}, {end_frame}]")
-                self.start_mark = None
-            self._show_frame()
-        elif key == "u":
-            if self.intervals:
-                removed = self.intervals.pop()
-                print(f"  [ep {self.episode}] removed interval {removed}")
-            else:
-                print(f"  [ep {self.episode}] nothing to undo")
-            self._show_frame()
-        elif key in ("left", "right"):
-            # Arrow keys step one frame (auto-pause); Shift+arrow jumps ±30.
-            step = 30 if (event.state & 0x0001) else 1
-            delta = step if key == "right" else -step
-            self.paused = True
-            self.frame = max(0, min(self.frame + delta, self.length - 1))
-            self._show_frame()
-
-    def _on_close(self) -> None:
-        self.quit_all = True
-        self.root.destroy()
-
-    def run(self) -> tuple[list[tuple[int, int]], bool]:
-        self.root.mainloop()
-        return self.intervals, self.quit_all
-
-
-def annotate_episode_gui(
-    episode: int,
-    video_infos: dict[str, tuple[Path, int]],
-    length: int,
-    fps: float,
-) -> tuple[list[tuple[int, int]], bool]:
-    """Play the episode in a tkinter window (all cameras side by side).
-
-    Each camera has its own start_frame inside its own video file, because
-    cameras can roll to new files at different times.
-    """
-    readers = {
-        camera: EpisodeFrameReader(path, start_frame, length, fps)
-        for camera, (path, start_frame) in video_infos.items()
-    }
-    print(f"\n=== Episode {episode} | {length} frames | cameras: {', '.join(video_infos)} ===")
-    print("Keys: s=interval START  e=interval END  u=undo  space=pause  "
-          "←/→=1 frame  Shift+←/→=±30  n=next  q=quit")
-    try:
-        annotator = _TkAnnotator(readers, episode, length)
-        return annotator.run()
-    finally:
-        for reader in readers.values():
-            reader.close()
 
 
 def render_contact_sheet(
@@ -466,7 +177,10 @@ def render_contact_sheet(
     cell_w, cell_h = thumb_width, thumb_height + label_height
     rows = (length + cols - 1) // cols
     sheet = np.full((rows * cell_h, cols * cell_w, 3), 30, dtype=np.uint8)
+    rendered = set()
     for episode_frame, image in iter_episode_frames(video_path, start_frame, length, fps):
+        if episode_frame in rendered:
+            continue
         col = episode_frame % cols
         row = episode_frame // cols
         thumb = cv2.resize(image, (thumb_width, thumb_height))
@@ -475,6 +189,9 @@ def render_contact_sheet(
         sheet[y0:y0 + thumb_height, x0:x0 + thumb_width] = thumb
         cv2.putText(sheet, f"{episode_frame}", (x0 + 2, y0 - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        rendered.add(episode_frame)
+    if len(rendered) != length:
+        raise ValueError(f"Expected {length} frames in {video_path}, rendered {len(rendered)}")
     return sheet
 
 
@@ -489,7 +206,7 @@ def annotate_episode_sheet(
     cols: int,
     thumb_width: int,
 ) -> tuple[list[tuple[int, int]], bool]:
-    """Render a contact sheet, then collect intervals from terminal input.
+    """Render a contact sheet, then collect one interval from terminal input.
 
     Returns (intervals, quit_all).
     """
@@ -497,10 +214,11 @@ def annotate_episode_sheet(
     sheet_path = sheet_dir / f"episode_{episode:04d}.png"
     sheet = render_contact_sheet(video_path, start_frame, length, fps,
                                  cols=cols, thumb_width=thumb_width)
-    cv2.imwrite(str(sheet_path), sheet)
+    if not cv2.imwrite(str(sheet_path), sheet):
+        raise OSError(f"Could not write annotation sheet: {sheet_path}")
     print(f"\n=== Episode {episode} | {length} frames | sheet: {sheet_path} ===")
-    print("Open the sheet image and enter critical-phase intervals.")
-    print("  '<start> <end>'  add interval | 'undo' | 'skip' | 'quit' | blank = next episode")
+    print("Mark before wrist alignment through release and stable placement.")
+    print("  '<start> <end>'  set single interval | 'undo' | 'skip' | 'quit' | blank = next episode")
     intervals: list[tuple[int, int]] = []
     while True:
         try:
@@ -508,7 +226,10 @@ def annotate_episode_sheet(
         except EOFError:
             return intervals, True
         if not line:
-            return intervals, False
+            if intervals:
+                return intervals, False
+            print("  mark an interval or type 'skip'")
+            continue
         if line in ("q", "quit"):
             return intervals, True
         if line == "skip":
@@ -530,55 +251,44 @@ def annotate_episode_sheet(
             if not (0 <= start <= end < length):
                 print(f"  out of range [0, {length - 1}]")
                 continue
-            intervals.append((start, end))
-            print(f"  added [{start}, {end}] (total {len(intervals)})")
+            intervals[:] = [(start, end)]
+            print(f"  interval [{start}, {end}] ready; Enter to save, or enter a replacement")
         else:
             print("  expected: '<start> <end>'")
 
 
 def main() -> None:
     args = parse_args()
-    dataset_path = Path(args.dataset_path)
+    dataset_path = Path(args.dataset_path).resolve(strict=True)
+    manifest = json.loads((Path(__file__).resolve().parents[1] / "configs/red_on_green_episodes.json").read_text(encoding="utf-8"))
+    if manifest["episode_indices"] != list(range(30)) or dataset_path.name != manifest["dataset"].split("/")[-1]:
+        raise ValueError("Dataset or episode manifest does not match the red-on-green episodes 0–29")
+    info = json.loads((dataset_path / "meta/info.json").read_text(encoding="utf-8"))
+    if info["fps"] != args.fps or info["features"].get(args.camera, {}).get("dtype") != "video":
+        raise ValueError("Dataset FPS or front-camera name does not match the annotation settings")
     out_path = Path(args.annotations_out)
     annotations = load_existing(out_path)
     if annotations:
         logger.info("Loaded %d previously annotated episodes; they will be skipped.", len(annotations))
 
-    episodes = episode_video_paths(dataset_path, args.fps)
-    logger.info("Found %d episodes in %s", len(episodes), dataset_path)
-
-    use_gui = not args.force_sheet and gui_available()
-    logger.info("Annotation mode: %s", "GUI playback (tkinter)" if use_gui else "contact-sheet (headless)")
+    episodes = episode_video_paths(dataset_path, args.fps, cameras=(args.camera,))
+    if [item[0] for item in episodes] != list(range(30)):
+        raise ValueError("Expected exactly red-on-green episodes 0 through 29")
+    logger.info("Found %d red-on-green episodes in %s", len(episodes), dataset_path)
+    for episode, _, length in episodes:
+        if episode in annotations and annotations[episode][0][1] >= length:
+            raise ValueError(f"Saved annotation for episode {episode} exceeds its {length} frames")
 
     try:
         for episode, video_infos, length in episodes:
             if episode in annotations:
                 logger.info("Skipping episode %d (already annotated: %s)", episode, annotations[episode])
                 continue
-            if use_gui:
-                intervals, should_quit = annotate_episode_gui(
-                    episode, video_infos, length, args.fps,
-                )
-            else:
-                sheet_camera = args.camera or next(
-                    (camera for camera in ("observation.images.top", "observation.images.front")
-                     if camera in video_infos),
-                    next(iter(video_infos)),
-                )
-                sheet_info = video_infos.get(sheet_camera)
-                if sheet_info is None:
-                    logger.warning(
-                        "Episode %d: camera %s unavailable (have %s); skipping.",
-                        episode, sheet_camera, sorted(video_infos),
-                    )
-                    continue
-                sheet_video, sheet_start = sheet_info
-                intervals, should_quit = annotate_episode_sheet(
-                    episode, sheet_video, sheet_start, length, args.fps,
-                    sheet_dir=Path(args.sheet_dir),
-                    cols=args.sheet_cols,
-                    thumb_width=args.thumb_width,
-                )
+            sheet_video, sheet_start = video_infos[args.camera]
+            intervals, should_quit = annotate_episode_sheet(
+                episode, sheet_video, sheet_start, length, args.fps,
+                sheet_dir=Path(args.sheet_dir), cols=12, thumb_width=160,
+            )
             if intervals:
                 annotations[episode] = intervals
                 save_annotations(out_path, annotations)

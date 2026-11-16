@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Convert a lerobot-trained Stage-1 pi05_rlt checkpoint into the legacy .pt.
+"""Convert a LeRobot-trained Stage 1 checkpoint into the online encoder bundle.
 
 Stage 1 can now be trained with the standard toolchain
 (``lerobot-train --policy.type=pi05_rlt --policy.mode=rlt_training``), whose
 checkpoints live under ``outputs/<run>/checkpoints/<step>/pretrained_model/``.
-The Stage-2 online-RL trainer (``train_rlt_stage2_pi05.py``) still consumes the
-legacy Stage-1 ``.pt`` bundle (``encoder_state_dict``/``decoder_state_dict`` +
-``rlt_architecture``/``image_only`` metadata). This script bridges the two:
+The online brain consumes a Stage 1 ``.pt`` bundle with
+``encoder_state_dict``/``decoder_state_dict`` and ``rlt_architecture``/
+``image_only`` metadata. This script produces that bundle:
 
     python scripts/convert_stage1_pretrained.py \
         --pretrained-dir outputs/ltrain_synth/checkpoints/000006/pretrained_model \

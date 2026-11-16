@@ -105,6 +105,8 @@ class CriticalPhaseDetector:
 
     def reset(self) -> None:
         self._probabilities.clear()
+        self._update_count = 0
+        self._on_since_update = None
 
     def update(self, z_rl, proprio) -> bool | None:
         """Return True/False when the smoothed probability crosses a threshold, else None.
