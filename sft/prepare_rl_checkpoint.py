@@ -17,21 +17,16 @@ JOINT_NAMES = (
 
 
 def _openpi_stats(path: Path) -> dict:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    result = {}
-    for source, target in (("state", "observation.state"), ("actions", "action")):
-        if source not in data:
-            raise ValueError(f"OpenPI normalization stats missing {source!r}: {path}")
-        item = data[source]
-        if not isinstance(item, dict):
-            raise ValueError(f"Invalid normalization stats for {source}: {path}")
-        result[target] = {}
-        for name in ("q01", "q99"):
-            values = item.get(name)
-            if not isinstance(values, list) or len(values) != 6:
-                raise ValueError(f"Expected six {name} values in {source}: {path}")
-            result[target][name] = values
-    return result
+    # The converted OpenPI asset is nested under norm_stats; a fork may
+    # instead publish observation.state/action at the top level. Use the same
+    # validated delta-action quantiles as the online learner and replay tools.
+    from scripts.rlt_core import openpi_quantiles
+
+    state_low, state_high, action_low, action_high = openpi_quantiles(path)
+    return {
+        "observation.state": {"q01": state_low.tolist(), "q99": state_high.tolist()},
+        "action": {"q01": action_low.tolist(), "q99": action_high.tolist()},
+    }
 
 
 def prepare(converted: Path, output: Path, norm_stats: Path) -> Path:
@@ -93,7 +88,7 @@ def main():
     parser.add_argument("--converted", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--norm-stats", type=Path, required=True,
-                        help="OpenPI checkpoint assets/<repo-id>/norm_stats.json (delta action quantiles)")
+                        help="Same-checkpoint OpenPI norm_stats.json (delta action quantiles; nested or flat)")
     args = parser.parse_args()
     print(prepare(args.converted, args.output, args.norm_stats))
 

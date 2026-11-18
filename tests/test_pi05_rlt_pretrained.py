@@ -51,6 +51,12 @@ class DummyBackbone(torch.nn.Module):
     def extract_embeddings(self, *args, **kwargs):
         raise NotImplementedError("dummy")
 
+    def embed_prefix(self, *args, **kwargs):
+        raise NotImplementedError("dummy")
+
+    def embed_suffix(self, *args, **kwargs):
+        raise NotImplementedError("dummy")
+
     def sample_actions(self, *args, **kwargs):
         raise NotImplementedError("dummy")
 

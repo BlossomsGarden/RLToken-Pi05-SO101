@@ -33,9 +33,11 @@ def test_cpu_update_and_resume_discards_only_uncommitted_tail(tmp_path):
                              n_action_steps_rl=10, actor_hidden_dim=16, actor_num_layers=2,
                              critic_hidden_dim=16, critic_num_layers=2, policy_fixed_std=.05)
     actor = RLTChunkActor(config)
-    trainer = Stage2Trainer(actor, config, tmp_path, batch_size=16, utd=1,
+    trainer = Stage2Trainer(actor, config, tmp_path, batch_size=2, utd=1,
                             warmup_episodes=1, actor_start_updates=0)
-    trainer.add_episode(1, [make_transition(1, 0), make_transition(1, 10, human=True)], 1)
+    trainer.add_episode(1, [], 0)
+    assert trainer.episodes_completed == 0
+    trainer.add_episode(2, [make_transition(2, 0), make_transition(2, 10, human=True)], 1)
     deadline = time.monotonic() + 10
     while trainer.updates < 2 and not trainer.worker_error and time.monotonic() < deadline:
         time.sleep(.05)
@@ -49,11 +51,31 @@ def test_cpu_update_and_resume_discards_only_uncommitted_tail(tmp_path):
     resumed = Stage2Trainer(RLTChunkActor(config), config, tmp_path, resume=checkpoint,
                              batch_size=2, utd=1, warmup_episodes=1)
     try:
-        assert resumed.episode == 1
+        assert resumed.episode == 2
+        assert resumed.episodes_completed == 1
         assert (tmp_path / "replay_journal.pkl").stat().st_size == committed
         assert len(resumed.replay) == 2
-        resumed.add_episode(2, [make_transition(2, 0)], 0)
+        resumed.add_episode(3, [make_transition(3, 0)], 0)
         resumed.save()
         assert (tmp_path / "previous_checkpoint.pt").is_file()
     finally:
         resumed.close()
+
+
+def test_learner_waits_for_full_batch_after_warmup(tmp_path):
+    config = SimpleNamespace(rlt_hidden_dim=8, state_dim=6, action_dim=6,
+                             n_action_steps_rl=10, actor_hidden_dim=16, actor_num_layers=2,
+                             critic_hidden_dim=16, critic_num_layers=2, policy_fixed_std=.05)
+    trainer = Stage2Trainer(RLTChunkActor(config), config, tmp_path, batch_size=3, utd=1,
+                            warmup_episodes=1, actor_start_updates=0)
+    try:
+        trainer.add_episode(1, [make_transition(1, 0), make_transition(1, 10)], 0)
+        time.sleep(.15)
+        assert trainer.episodes_completed == 1 and trainer.updates == 0
+        trainer.add_episode(2, [make_transition(2, 0)], 1)
+        deadline = time.monotonic() + 5
+        while trainer.updates == 0 and not trainer.worker_error and time.monotonic() < deadline:
+            time.sleep(.05)
+        assert trainer.updates >= 1 and trainer.worker_error is None
+    finally:
+        trainer.close()

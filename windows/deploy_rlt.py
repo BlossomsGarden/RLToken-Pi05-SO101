@@ -26,6 +26,23 @@ def command(values):
     return {f"{name}.pos": float(values[i]) for i, name in enumerate(JOINTS)}
 
 
+def actor_requested(keys, args):
+    """Smooth 50-step execution records replay; Actor runs in window-replan mode."""
+    return keys.actor and not args.no_replan_every_window
+
+
+def apply_actor_patch(plan, patch, index):
+    start = int(patch["start"])
+    rows = joints(patch["actions"], rows=True, max_rows=10)
+    end = start + len(rows)
+    first = max(start, index)
+    if start < 0 or end > 50 or first >= end or (index > start and index // 10 != start // 10):
+        return False
+    plan["actions"][first:end] = rows[first - start:]
+    plan["actor_start"] = start
+    return True
+
+
 def observation(robot):
     raw = robot.get_observation()
     return {"state": positions(raw).tolist(), "front": jpeg(raw["front"]), "side": jpeg(raw["side"])}
@@ -37,7 +54,7 @@ def read_env(path):
     try:
         lines = path.read_text(encoding="utf-8-sig").splitlines()
     except UnicodeDecodeError:
-        lines = path.read_text(encoding="gbk").splitlines()
+        lines = path.read_text(encoding="gbk", errors="replace").splitlines()
     result = {}
     for raw in lines:
         if "=" not in raw or raw.lstrip().startswith("#"):
@@ -71,7 +88,10 @@ def next_local_episode(folder):
 def save_episode(folder, episode, record):
     """Save compact numeric telemetry; JPEG images stay on the transport only."""
     folder.mkdir(parents=True, exist_ok=True)
-    destination = folder / f"ep_{episode:04d}.npz"
+    aborted = bool(record.get("aborted", False))
+    filename = (f"aborted_ep_{episode:04d}_{time.time_ns()}.npz" if aborted
+                else f"ep_{episode:04d}.npz")
+    destination = folder / filename
     if destination.exists():
         raise FileExistsError(destination)
     temporary = destination.with_suffix(".npz.tmp")
@@ -79,6 +99,7 @@ def save_episode(folder, episode, record):
     with temporary.open("wb") as stream:
         np.savez_compressed(
             stream, episode=np.int32(episode), reward=np.int8(record["reward"]),
+            aborted=np.bool_(aborted),
             state=np.asarray([x["state"] for x in steps], dtype=np.float32).reshape(-1, 6),
             action=np.asarray([x["action"] for x in steps], dtype=np.float32).reshape(-1, 6),
             leader=np.asarray([x["leader"] for x in steps], dtype=np.float32).reshape(-1, 6),
@@ -93,12 +114,32 @@ def save_episode(folder, episode, record):
         stream.flush()
         os.fsync(stream.fileno())
     temporary.replace(destination)
+    return destination
+
+
+def abort_episode(broker, folder, episode, step, record, timeout, error):
+    """Best-effort replay discard and local audit after a mid-episode failure."""
+    try:
+        broker.submit({"command": "finish", "episode": episode, "step": step,
+                       "reward": 0, "discard": True}).result(timeout=timeout)
+    except Exception as cleanup_error:
+        print(f"Brain discard unavailable ({type(cleanup_error).__name__}); "
+              "the server will clear the episode when this connection closes")
+    record["reward"] = -1
+    record["aborted"] = True
+    try:
+        audit = save_episode(folder, episode, record)
+    except Exception as audit_error:
+        print(f"Aborted episode audit failed ({type(audit_error).__name__})")
+    else:
+        print(f"Episode {episode} aborted ({type(error).__name__}); audit saved: {audit}")
 
 
 class Keys:
-    def __init__(self, *, auto_critical):
+    def __init__(self, *, auto_critical, actor=False, actor_mode=True):
         self.human = False
-        self.actor = True
+        self.actor = bool(actor)
+        self.actor_mode = bool(actor_mode)
         self.manual_critical = None if auto_critical else False
         self.auto_critical = auto_critical
         self.manual_until = None
@@ -106,13 +147,12 @@ class Keys:
         self.quit = False
         self.emergency = False
         self.changed = False
+        self.actor_changed = False
         self.phase_changed = False
 
-    def poll(self):
+    def poll(self, current_critical=None):
         import msvcrt
-        self.changed = self.phase_changed = False
-        if self.auto_critical and self.manual_until and time.monotonic() >= self.manual_until:
-            self.manual_critical = self.manual_until = None
+        self.changed = self.actor_changed = self.phase_changed = False
         while msvcrt.kbhit():
             key = msvcrt.getwch().lower()
             if key == "h" and not self.human:
@@ -120,11 +160,18 @@ class Keys:
             elif key == "s" and self.human:
                 self.human, self.changed = False, True
             elif key == "c":
-                self.manual_critical = not bool(self.manual_critical)
+                self.manual_critical = not (bool(current_critical) if self.auto_critical else bool(self.manual_critical))
                 if self.auto_critical:
                     self.manual_until = time.monotonic() + 3
                 self.phase_changed = True
                 print(f"Critical phase: {self.manual_critical}")
+            elif key == "a":
+                if not self.actor_mode:
+                    print("Actor requires window replanning; restart without --no-replan-every-window")
+                    continue
+                self.actor = not self.actor
+                self.actor_changed = True
+                print(f"Actor execution: {'enabled' if self.actor else 'disabled'}")
             elif key == "f":
                 self.outcome = "finish"
             elif key == "g":
@@ -133,6 +180,12 @@ class Keys:
                 self.quit, self.outcome = True, "discard"
             elif key == "e":
                 self.emergency, self.outcome = True, "discard"
+
+    def manual_override(self):
+        if not self.auto_critical or (self.manual_until is not None and
+                                      time.monotonic() < self.manual_until):
+            return self.manual_critical
+        return None
 
 
 class GripperHold:
@@ -189,22 +242,37 @@ class LeaderMirror:
     """Low-torque, smoothed feedback; a takeover offset avoids manual alignment."""
     def __init__(self, leader, *, ratio=.5, smoothing=.35, max_step_deg=5):
         self.leader, self.smoothing, self.max_step_deg = leader, smoothing, max_step_deg
-        self.limits = {}
         self.enabled = False
-        try:
-            for name in JOINTS:
-                original = int(leader.bus.read("Max_Torque_Limit", name, normalize=False))
-                if not 0 < original <= 1000:
-                    raise ValueError(f"Verify {name} leader Max_Torque_Limit before enabling mirror")
-                self.limits[name] = original
-                leader.bus.write("Max_Torque_Limit", name, min(original, int(1000 * ratio)), normalize=False)
-        except Exception:
-            self.close()
-            raise
+        if not 0 < ratio <= 1:
+            raise ValueError("Leader torque fraction must lie within (0, 1]")
+        self.low, self.high = self._reachable_limits(leader)
+        # Address 48 is volatile SRAM. Never write Max_Torque_Limit at EEPROM address 16.
+        for name in JOINTS:
+            leader.bus.write("Torque_Limit", name, int(1000 * ratio), normalize=False)
+
+    @staticmethod
+    def _reachable_limits(leader):
+        bus = leader.bus
+        if not bus.calibration or set(bus.calibration) != set(JOINTS):
+            raise ValueError("Leader calibration must cover all six joints before mirroring")
+        low, high = [], []
+        for name in JOINTS:
+            calibration = bus.calibration[name]
+            if calibration.range_min >= calibration.range_max:
+                raise ValueError(f"Invalid leader calibration range for {name}")
+            if name == "gripper":
+                low.append(0.0)
+                high.append(100.0)
+            else:
+                resolution = bus.model_resolution_table[bus.motors[name].model] - 1
+                half_range = (calibration.range_max - calibration.range_min) * 180 / resolution
+                low.append(-half_range)
+                high.append(half_range)
+        return np.asarray(low, dtype=np.float32), np.asarray(high, dtype=np.float32)
 
     def resume(self):
         current = positions(self.leader.get_action())
-        self.leader.send_feedback(command(current))
+        self.leader.send_feedback(command(np.clip(current, self.low, self.high)))
         self.leader.enable_torque()
         self.enabled = True
 
@@ -213,7 +281,7 @@ class LeaderMirror:
             current = positions(self.leader.get_action())
             target = current + np.clip((follower - current) * self.smoothing,
                                        -self.max_step_deg, self.max_step_deg)
-            self.leader.send_feedback(command(target))
+            self.leader.send_feedback(command(np.clip(target, self.low, self.high)))
 
     def relax(self):
         if self.enabled:
@@ -222,20 +290,31 @@ class LeaderMirror:
 
     def close(self):
         self.relax()
-        for name, original in self.limits.items():
-            self.leader.bus.write("Max_Torque_Limit", name, original, normalize=False)
 
 
-def wait_settled(robot, last, cfg):
+def wait_settled(robot, cfg):
     tolerance = np.asarray(cfg["settle_tolerance_deg"], dtype=np.float32)
     deadline = time.monotonic() + cfg["settle_timeout_s"]
-    while True:
+    previous, stable = None, 0
+    while time.monotonic() < deadline:
         present = robot.bus.sync_read("Present_Position", num_retry=robot.config.num_read_retries)
-        if np.all(np.abs(last - joints([present[name] for name in JOINTS])) <= tolerance):
-            return
-        if time.monotonic() >= deadline:
-            raise RuntimeError("Follower failed to settle after the 50-step chunk")
-        time.sleep(.01)
+        current = joints([present[name] for name in JOINTS])
+        stable = stable + 1 if previous is not None and np.all(np.abs(current - previous) <= tolerance) else 0
+        if stable >= 4:
+            return True
+        previous = current
+        time.sleep(.05)
+    print("Warning: follower did not settle before timeout; continuing with measured pose")
+    return False
+
+
+def reset_follower_torque(robot):
+    """Let an operator position the arm, then hold its new pose before moving."""
+    robot.bus.disable_torque()
+    input("Reset arm and blocks to demo start; Enter to begin: ")
+    parked = robot.bus.sync_read("Present_Position", num_retry=robot.config.num_read_retries)
+    robot.bus.sync_write("Goal_Position", parked)
+    robot.bus.enable_torque()
 
 
 def terminal_label():
@@ -281,7 +360,7 @@ def run(args, cfg):
         robot.connect(calibrate=not args.no_calibration)
         if not args.execute:
             result = broker.submit({"command": "plan", "episode": episode, "step": 0,
-                                    "actor": True, "manual_critical": False if args.no_auto_critical else None,
+                                    "actor": False, "manual_critical": False if args.no_auto_critical else None,
                                     **observation(robot)}).result(timeout=cfg["network_timeout_s"])
             try:
                 current = positions(robot.get_observation())
@@ -296,12 +375,15 @@ def run(args, cfg):
         leader = SO101Leader(SO101LeaderConfig(port=cfg["leader_port"], id=cfg["leader_id"]))
         leader.connect(calibrate=not args.no_calibration)
         mirror = LeaderMirror(leader)
-        print("h=takeover s=resume c=critical f=finish g=skip q=quit e=emergency")
+        print("a=actor h=takeover s=resume c=critical f=finish g=skip q=quit e=emergency")
         finished = 0
+        actor_enabled = False
         while args.episodes == 0 or finished < args.episodes:
             mirror.relax()
-            input(f"Reset arm and blocks to demo start; Enter to begin episode {episode}: ")
-            keys = Keys(auto_critical=not args.no_auto_critical)
+            print(f"Episode {episode}: place the arm and blocks at the demo start pose")
+            reset_follower_torque(robot)
+            keys = Keys(auto_critical=not args.no_auto_critical, actor=actor_enabled,
+                        actor_mode=not args.no_replan_every_window)
             mirror.resume()
             step, index, plan = 0, 0, None
             offset = None
@@ -314,22 +396,24 @@ def run(args, cfg):
             last_reported_update = None
             human_start = None
 
-            def submit_slice(*, interrupt=False):
+            def submit_slice(*, interrupt=False, defer_close=False, close_critical=None):
                 nonlocal recent, sources, labels
                 if not recent:
                     return False
-                if not all(labels):
-                    # Non-critical and phase-crossing windows do not enter replay.
+                closing = labels[-1] if close_critical is None else bool(close_critical)
+                if not closing and not defer_close:
                     recent, sources, labels = [], [], []
                     return False
                 if plan is None:
                     raise RuntimeError("Cannot record executed actions without a parent plan")
-                snapshot = observation(robot)
+                snapshot = {} if defer_close else observation(robot)
                 payload = {"command": "human_slice" if all(s == "HUMAN" for s in sources) else "boundary_slice",
                            "episode": episode, "plan_id": plan["plan_id"], "step": step,
-                           "actual": recent, "sources": sources, "critical_steps": labels,
-                           "interrupted": bool(interrupt), "actor": keys.actor,
-                           "manual_critical": keys.manual_critical, **snapshot}
+                           "actual": recent, "sources": sources,
+                           "critical_steps": [*labels[:-1], closing],
+                           "interrupted": bool(interrupt), "defer_close": defer_close,
+                           "actor": actor_requested(keys, args),
+                           "manual_critical": keys.manual_override(), **snapshot}
                 future = broker.submit(payload)
                 pending.append(future)
                 record["boundaries"].append({"step": step, "req_id": future.request_id})
@@ -352,125 +436,145 @@ def run(args, cfg):
                     last_reported_update = updates
                     patch = reply.get("patch")
                     if patch and plan is not None and reply.get("plan_id") == plan["plan_id"]:
-                        start = patch["start"]
-                        if index <= start and index // 10 == start // 10:
-                            rows = joints(patch["actions"], rows=True, max_rows=10)
-                            plan["actions"][start:start + len(rows)] = rows
-                            plan["actor_start"] = start
+                        apply_actor_patch(plan, patch, index)
 
-            while step < args.steps:
-                keys.poll()
-                if keys.emergency:
-                    robot.bus.disable_torque()
-                if keys.outcome is not None:
-                    break
-                collect_replies()
-                if keys.phase_changed and not keys.human and plan is not None:
-                    if not submit_slice(interrupt=True):
-                        pending.append(broker.submit({"command": "interrupt_plan", "episode": episode,
-                                                       "plan_id": plan["plan_id"], "step": step}))
-                    collect_replies(wait=True)
-                    plan = None
-                elif keys.phase_changed and keys.human and plan is not None:
-                    submit_slice(interrupt=True)
-                    pending.append(broker.submit({"command": "snapshot", "episode": episode,
-                                                   "plan_id": plan["plan_id"], "step": step,
-                                                   **observation(robot)}))
-                    human_start = step
-                if keys.changed and keys.human:
-                    if plan is None:
-                        keys.human = False
-                        print("Wait for a plan before taking over")
-                    else:
-                        mirror.relax()
-                        submit_slice(interrupt=True)
-                        pending.append(broker.submit({"command": "snapshot", "episode": episode,
-                                                       "plan_id": plan["plan_id"], "step": step,
-                                                       **observation(robot)}))
-                        human_start = step
-                        offset = last - positions(leader.get_action())
-                        print("Human takeover: model proposal refreshed without executing it")
-                elif keys.changed and not keys.human:
-                    submit_slice(interrupt=True)
-                    collect_replies(wait=True)
-                    mirror.resume()
-                    plan = None
-                    print("Autonomous replan from current observation")
-                if not keys.human and (plan is None or index >= 50):
-                    submit_slice()
-                    collect_replies(wait=True)
-                    result = broker.submit({"command": "plan", "episode": episode, "step": step,
-                                            "actor": keys.actor, "manual_critical": keys.manual_critical,
-                                            **observation(robot)}).result(timeout=cfg["network_timeout_s"])
-                    plan = {**result, "actions": joints(result["actions"], rows=True).copy(),
-                            "actor_start": 0 if result.get("actor_patch") else -1}
-                    critical = bool(result["critical"])
-                    if result.get("critical_prob") is not None:
-                        critical_prob = float(result["critical_prob"])
-                    index = 0
-                tick = time.monotonic()
-                present = positions({f"{name}.pos": value for name, value in
-                                     robot.bus.sync_read("Present_Position", num_retry=robot.config.num_read_retries).items()})
-                leader_position = positions(leader.get_action())
-                if keys.human:
-                    desired = leader_position + offset
-                    source = "HUMAN"
-                else:
-                    desired = plan["actions"][index]
-                    source = ("ACTOR" if plan["actor_start"] >= 0 and
-                              index // 10 == plan["actor_start"] // 10 else "VLA")
-                last = safe_action(robot, desired, hold, cfg, last, human=keys.human, present=present)
-                if not keys.human:
-                    mirror.feedback(last)
-                record["steps"].append({"state": present.tolist(), "action": last.tolist(),
-                                        "leader": leader_position.tolist(), "source": source,
-                                        "critical": bool(critical), "critical_prob": critical_prob,
-                                        "chunk_id": plan["plan_id"], "step_ms": (time.monotonic()-tick)*1000})
-                recent.append(last.tolist())
-                sources.append(source)
-                labels.append(bool(critical))
-                step += 1
-                if not keys.human:
-                    index += 1
-                if len(recent) == 10 or (not keys.human and index == 50):
-                    if not keys.human and index == 50:
-                        wait_settled(robot, last, cfg)
-                    replan = not keys.human and not args.no_replan_every_window and index < 50
-                    emitted = submit_slice(interrupt=replan)
-                    if replan and not emitted:
-                        pending.append(broker.submit({"command": "interrupt_plan", "episode": episode,
-                                                       "plan_id": plan["plan_id"], "step": step}))
-                    if not keys.human and critical:
-                        collect_replies(wait=True)
-                    if replan:
+            brain_finished = False
+            try:
+                while step < args.steps:
+                    keys.poll(critical)
+                    if keys.phase_changed:
+                        critical = bool(keys.manual_critical)
+                    if keys.emergency:
+                        robot.bus.disable_torque()
+                    if keys.outcome is not None:
+                        break
+                    collect_replies()
+                    if (keys.phase_changed or keys.actor_changed) and not keys.human and plan is not None and index < 50:
+                        if not submit_slice(interrupt=True, close_critical=critical if keys.phase_changed else None):
+                            pending.append(broker.submit({"command": "interrupt_plan", "episode": episode,
+                                                           "plan_id": plan["plan_id"], "step": step}))
                         collect_replies(wait=True)
                         plan = None
-                    if keys.human and human_start is not None and step-human_start >= 50:
+                    elif keys.phase_changed and keys.human and not keys.changed and plan is not None:
+                        submit_slice(interrupt=True, close_critical=critical)
                         pending.append(broker.submit({"command": "snapshot", "episode": episode,
                                                        "plan_id": plan["plan_id"], "step": step,
                                                        **observation(robot)}))
                         human_start = step
-                delay = 1/cfg["fps"] - (time.monotonic()-tick)
-                if delay > 0:
-                    time.sleep(delay)
-            if keys.outcome == "finish" or keys.outcome is None:
-                keys.outcome = terminal_label()
-            if step == 0 and keys.outcome != "discard":
-                raise RuntimeError("Cannot label an episode with no executed actions")
-            submit_slice(interrupt=True)
-            collect_replies(wait=True)
-            result = broker.submit({"command": "finish", "episode": episode, "step": step,
-                                    "reward": keys.outcome if keys.outcome != "discard" else 0,
-                                    "discard": keys.outcome == "discard"}).result(timeout=cfg["network_timeout_s"])
-            mirror.relax()
-            if keys.outcome != "discard":
-                record["reward"] = keys.outcome
-                save_episode(folder, episode, record)
-                finished += 1
-            print(f"Episode {episode}: {step} steps, label={keys.outcome}; next={result['next_episode']}")
-            episode = max(next_local_episode(folder), int(result["next_episode"]))
-            if keys.quit or keys.emergency:
-                break
+                    if keys.changed and keys.human:
+                        if plan is None:
+                            keys.human = False
+                            print("Wait for a plan before taking over")
+                        else:
+                            mirror.relax()
+                            submit_slice(interrupt=True, close_critical=critical if keys.phase_changed else None)
+                            pending.append(broker.submit({"command": "snapshot", "episode": episode,
+                                                           "plan_id": plan["plan_id"], "step": step,
+                                                           **observation(robot)}))
+                            human_start = step
+                            offset = last - positions(leader.get_action())
+                            print("Human takeover: model proposal refreshed without executing it")
+                    elif keys.changed and not keys.human:
+                        submit_slice(interrupt=True)
+                        collect_replies(wait=True)
+                        mirror.resume()
+                        plan = None
+                        print("Autonomous replan from current observation")
+                    if not keys.human and (plan is None or index >= 50):
+                        submit_slice()
+                        collect_replies(wait=True)
+                        result = broker.submit({"command": "plan", "episode": episode, "step": step,
+                                                "actor": actor_requested(keys, args),
+                                                "manual_critical": keys.manual_override(),
+                                                **observation(robot)}).result(timeout=cfg["network_timeout_s"])
+                        plan = {**result, "actions": joints(result["actions"], rows=True).copy(),
+                                "actor_start": 0 if result.get("actor_patch") else -1}
+                        critical = bool(result["critical"])
+                        if result.get("critical_prob") is not None:
+                            critical_prob = float(result["critical_prob"])
+                        index = 0
+                    tick = time.monotonic()
+                    present = positions({f"{name}.pos": value for name, value in
+                                         robot.bus.sync_read("Present_Position", num_retry=robot.config.num_read_retries).items()})
+                    leader_position = positions(leader.get_action())
+                    if keys.human:
+                        desired = leader_position + offset
+                        source = "HUMAN"
+                    else:
+                        desired = plan["actions"][index]
+                        source = ("ACTOR" if plan["actor_start"] >= 0 and
+                                  index // 10 == plan["actor_start"] // 10 else "VLA")
+                    last = safe_action(robot, desired, hold, cfg, last, human=keys.human, present=present)
+                    if not keys.human:
+                        mirror.feedback(last)
+                    record["steps"].append({"state": present.tolist(), "action": last.tolist(),
+                                            "leader": leader_position.tolist(), "source": source,
+                                            "critical": bool(critical), "critical_prob": critical_prob,
+                                            "chunk_id": plan["plan_id"], "step_ms": (time.monotonic()-tick)*1000})
+                    recent.append(last.tolist())
+                    sources.append(source)
+                    labels.append(bool(critical))
+                    step += 1
+                    if not keys.human:
+                        index += 1
+                    if len(recent) == 10 or (not keys.human and index == 50):
+                        if not keys.human and index == 50:
+                            wait_settled(robot, cfg)
+                        replan = not keys.human and not args.no_replan_every_window and index < 50
+                        emitted = submit_slice(interrupt=replan, defer_close=not keys.human and index == 50)
+                        if replan and not emitted:
+                            pending.append(broker.submit({"command": "interrupt_plan", "episode": episode,
+                                                           "plan_id": plan["plan_id"], "step": step}))
+                        if replan:
+                            collect_replies(wait=True)
+                            plan = None
+                        if keys.human and human_start is not None and step-human_start >= 10:
+                            pending.append(broker.submit({"command": "snapshot", "episode": episode,
+                                                           "plan_id": plan["plan_id"], "step": step,
+                                                           **observation(robot)}))
+                            human_start = step
+                    delay = 1/cfg["fps"] - (time.monotonic()-tick)
+                    if delay > 0:
+                        time.sleep(delay)
+                if keys.outcome == "finish" or keys.outcome is None:
+                    keys.outcome = terminal_label()
+                if step == 0 and keys.outcome != "discard":
+                    raise RuntimeError("Cannot label an episode with no executed actions")
+                collect_replies(wait=True)
+                if keys.outcome != "discard":
+                    wait_settled(robot, cfg)
+                    final = broker.submit({"command": "terminal_snapshot", "episode": episode,
+                                           "plan_id": plan["plan_id"], "step": step,
+                                           "actual": recent, "sources": sources,
+                                           "critical_steps": labels, "interrupted": True,
+                                           "manual_critical": keys.manual_override(), **observation(robot)})
+                    record["boundaries"].append({"step": step, "req_id": final.request_id})
+                    final.result(timeout=cfg["network_timeout_s"])
+                result = broker.submit({"command": "finish", "episode": episode, "step": step,
+                                        "reward": keys.outcome if keys.outcome != "discard" else 0,
+                                        "discard": keys.outcome == "discard"}).result(timeout=cfg["network_timeout_s"])
+                brain_finished = True
+                mirror.relax()
+                if keys.outcome != "discard":
+                    record["reward"] = keys.outcome
+                    save_episode(folder, episode, record)
+                    finished += 1
+                print(f"Episode {episode}: {step} steps, label={keys.outcome}; next={result['next_episode']}")
+                actor_enabled = keys.actor
+                episode = max(next_local_episode(folder), int(result["next_episode"]))
+                if keys.quit or keys.emergency:
+                    break
+            except BaseException as error:
+                if not brain_finished:
+                    try:
+                        mirror.relax()
+                    except Exception:
+                        pass
+                    abort_episode(broker, folder, episode, step, record,
+                                  cfg["network_timeout_s"], error)
+                else:
+                    print("Brain already acknowledged the result; inspect the local archive and replay")
+                raise
     finally:
         broker.close()
         if mirror is not None:
@@ -484,7 +588,10 @@ def run(args, cfg):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=ROOT / "configs" / "robot.json")
-    parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
+    default_env = ROOT / ".env"
+    if not default_env.is_file():
+        default_env = ROOT.parent / ".env"
+    parser.add_argument("--env-file", type=Path, default=default_env)
     parser.add_argument("--episodes", type=int, default=0, help="0 continues until q")
     parser.add_argument("--steps", type=int, default=1500)
     parser.add_argument("--execute", action="store_true")

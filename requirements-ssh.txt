@@ -3,6 +3,7 @@
 # Python 3.12 PyTorch RL environment. See README.md for exact commands.
 # Installing this file alone does not install JAX, CUDA Torch, or LeRobot.
 numpy>=1.26,<3
+draccus==0.11.6
 Pillow>=10,<13
 msgpack>=1.0,<2
 websockets>=14,<18

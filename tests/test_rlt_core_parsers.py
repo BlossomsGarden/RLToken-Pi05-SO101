@@ -14,10 +14,24 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
 
 from rlt_core import (  # noqa: E402
     _validate_quantiles,
+    openpi_quantiles,
     parse_camera_map,
     parse_max_relative_target,
     quantile_normalize,
 )
+
+
+@pytest.mark.parametrize("layout", ["flat", "fork", "checkpoint"])
+def test_openpi_quantiles_accepts_original_checkpoint_and_fork_layouts(tmp_path, layout):
+    import json
+    state = {"q01": [-1.0] * 6, "q99": [1.0] * 6}
+    actions = {"q01": [-2.0] * 6, "q99": [2.0] * 6}
+    data = ({"observation.state": state, "action": actions} if layout == "fork" else
+            {"norm_stats": {"state": state, "actions": actions}} if layout == "checkpoint" else
+            {"state": state, "actions": actions})
+    path = tmp_path / "stats.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert [values[0] for values in openpi_quantiles(path)] == [-1, 1, -2, 2]
 
 
 # ── parse_camera_map ────────────────────────────────────────────────────────

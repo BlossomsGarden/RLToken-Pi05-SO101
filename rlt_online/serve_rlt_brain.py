@@ -17,7 +17,7 @@ from rlt_online.action_space import absolute_to_delta, delta_to_absolute, normal
 from rlt_online.learner import Stage2Trainer
 from rlt_online.joint_mapping import JointMapping
 from rlt_online.protocol import MAX_MESSAGE_BYTES, SOURCES, TASK, image, joints, pack, unpack
-from scripts.rlt_core import Transition, TransitionSource
+from scripts.rlt_core import Transition, TransitionSource, openpi_quantiles
 
 LOG = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,11 +29,10 @@ def resolve_asset(path):
 
 
 def quantiles(path, key):
-    data = json.loads(resolve_asset(path).read_text(encoding="utf-8"))[key]
-    low, high = joints(data["q01"]), joints(data["q99"])
-    if np.any(high <= low):
-        raise ValueError(f"Invalid {key} quantiles")
-    return low, high
+    values = openpi_quantiles(resolve_asset(path))
+    if key not in ("state", "actions"):
+        raise ValueError(f"Invalid OpenPI quantile key: {key}")
+    return values[:2] if key == "state" else values[2:]
 
 
 def pad_chunk(rows, start, width=10):
@@ -116,6 +115,7 @@ class Brain:
         self.critical, self.critical_since, self.detected_once = False, None, False
         self.transitions = []
         self.pending_next_ref = None
+        self.deferred_slice = None
         self.plan_interrupted = False
         self.human_start_step = None
         self.human_reference = None
@@ -162,7 +162,7 @@ class Brain:
     def _actor_allowed(self, payload, step):
         return (bool(payload.get("actor")) and self.critical
                 and self.critical_since is not None and step - self.critical_since >= 20
-                and (self.trainer is None or (self.episode > self.trainer.warmup_episodes
+                and (self.trainer is None or (self.trainer.episodes_completed >= self.trainer.warmup_episodes
                                               and self.trainer.updates >= self.trainer.actor_start_updates)))
 
     def _actor_patch(self, boundary, start, payload):
@@ -181,27 +181,34 @@ class Brain:
 
     def _record_slice(self, payload, boundary, *, human=False):
         step = int(payload["step"])
-        if step <= self.last_step or step - self.last_step > 10 or (not human and step > self.plan_start + 50):
+        if step <= self.last_step or (not human and step > self.plan_start + 50):
             raise ValueError("Replay requires ordered, at-most-10-step boundary slices")
         actual = self.mapping.to_model(joints(payload["actual"], rows=True, max_rows=10))
-        if len(actual) != step - self.last_step:
-            raise ValueError("Actual action count must equal elapsed control steps")
         sources = payload["sources"]
         if len(sources) != len(actual):
             raise ValueError("Every actual action requires its own source label")
         if len(payload["critical_steps"]) != len(actual):
             raise ValueError("Every action requires a critical-phase label")
         count = len(actual)
+        if count == 0:
+            raise ValueError("Boundary slices require executed actions")
         start = self.last_step
+        if step - start > 10:
+            LOG.warning("Skipping noncontiguous critical window at step %s (previous %s)", step, start)
+            self.last_boundary, self.last_step, self.pending_next_ref = boundary, step, None
+            return
+        if count != step - start:
+            raise ValueError("Actual action count must equal elapsed control steps")
         close_critical = bool(payload["critical_steps"][-1])
-        record_window = (close_critical and (human or self.critical)
-                         and all(bool(label) for label in payload["critical_steps"]))
+        record_window = close_critical and self.critical
         if not record_window:
             if boundary is not None:
                 self.last_boundary = boundary
             self.last_step = step
             self.pending_next_ref = None
             return
+        if boundary is None or self.last_boundary is None:
+            raise ValueError("Critical replay requires both closing and opening observations")
         normalized = absolute_to_delta(actual, self.last_boundary["state"], self.delta_low, self.delta_high)
         if human and self.pending_next_ref is not None:
             self.pending_next_ref.next_ref_chunk = pad_chunk(self.human_reference, 0)
@@ -226,7 +233,8 @@ class Brain:
                                      step-(self.human_start_step if human else self.plan_start)),
             source=source_id(sources), source_chunk=np.pad(source_ids, (0, 10-count), constant_values=int(TransitionSource.BASE)),
             valid_mask=np.arange(10) < count, executed_steps=count,
-            collection_phase="warmup" if self.episode <= 5 else "online",
+            collection_phase=("warmup" if getattr(self, "trainer", None) is not None and
+                              self.trainer.episodes_completed < self.trainer.warmup_episodes else "online"),
             intervention_flag="HUMAN" in sources, episode_id=self.episode, step_id=self.last_step))
         if step == self.plan_start + 50 or payload.get("interrupted") or human:
             self.pending_next_ref = self.transitions[-1]
@@ -253,6 +261,7 @@ class Brain:
                 self.critical = self.detected_once = False
                 self.critical_since = None
                 self.human_reference = self.human_start_step = None
+                self.deferred_slice = None
             if self.plan_id is not None and int(payload["step"]) != self.plan_start + 50 and not self.plan_interrupted:
                 raise ValueError("Finish the prior plan or interrupt it with an exact boundary slice")
             if self.plan_id is not None and (int(payload["step"]) < self.last_step or
@@ -266,6 +275,12 @@ class Brain:
                 raw_actions = model_actions.cpu().numpy()
                 absolute = delta_to_absolute(raw_actions[0], state, self.delta_low, self.delta_high)
                 boundary = self._encode(state, batch, model_actions)
+            self._critical(boundary, payload)
+            if self.deferred_slice is not None:
+                staged = dict(self.deferred_slice)
+                staged["critical_steps"] = [*staged["critical_steps"][:-1], self.critical]
+                self._record_slice(staged, boundary)
+                self.deferred_slice = None
             self.plan_id, self.plan_start = req_id, int(payload["step"])
             self.plan_interrupted = False
             self.reference, self.raw_model_actions = absolute, model_actions
@@ -274,7 +289,6 @@ class Brain:
             self.pending_next_ref = None
             self.plan_actions = absolute.copy()
             self.last_boundary, self.last_step = boundary, self.plan_start
-            self._critical(boundary, payload)
             patch = self._actor_patch(boundary, 0, payload)
             if patch:
                 self.plan_actions[:len(patch["actions"])] = patch["actions"]
@@ -289,6 +303,13 @@ class Brain:
                 raise ValueError("Stale episode or plan boundary")
             if int(payload["step"]) > self.plan_start + 50:
                 raise ValueError("Slice exceeds the parent VLA chunk")
+            if payload.get("defer_close"):
+                if (int(payload["step"]) != self.plan_start + 50 or payload.get("interrupted")
+                        or self.deferred_slice is not None):
+                    raise ValueError("Deferred slice must close exactly one complete parent chunk")
+                self.deferred_slice = dict(payload)
+                return {"req_id": req_id, "critical": self.critical,
+                        "updates": self.trainer.updates if self.trainer else None}
             boundary = None
             if self.critical or any(payload["critical_steps"]) or payload.get("manual_critical"):
                 state, batch = self._batch(payload)
@@ -340,22 +361,52 @@ class Brain:
                 int(payload["step"]) < self.last_step or
                 (not self.plan_interrupted and int(payload["step"]) > self.plan_start + 50)):
                 raise ValueError("Snapshot requires the last acknowledged takeover boundary")
-            if int(payload["step"]) > self.last_step:
+            if int(payload["step"]) > self.last_step and self.deferred_slice is None:
                 self.pending_next_ref = None
-            self.last_step = int(payload["step"])
-            self.plan_interrupted = True
             state, batch = self._batch(payload)
             with torch.no_grad(), self.lock, torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 raw = self.model.predict_action_chunk(batch, noise=self.noise).float()
                 if tuple(raw.shape) != (1, 50, 6):
                     raise ValueError("Snapshot must contain a 50x6 VLA proposal")
                 boundary = self._encode(state, batch, raw)
+            if self.deferred_slice is not None:
+                if int(payload["step"]) != int(self.deferred_slice["step"]):
+                    raise ValueError("Takeover snapshot must close the staged window")
+                self._record_slice(self.deferred_slice, boundary)
+                self.deferred_slice = None
+            self.last_step = int(payload["step"])
+            self.plan_interrupted = True
             self.human_start_step = self.last_step
             self.human_reference = raw[0].cpu().numpy()
             self.last_boundary = boundary
             if self.pending_next_ref is not None and self.pending_next_ref.step_id + self.pending_next_ref.executed_steps == self.last_step:
                 self.pending_next_ref.next_ref_chunk = pad_chunk(self.human_reference, 0)
                 self.pending_next_ref = None
+            return {"req_id": req_id, "critical": self.critical,
+                    "updates": self.trainer.updates if self.trainer else None}
+        if command == "terminal_snapshot":
+            step = int(payload["step"])
+            if (episode != self.episode or payload["plan_id"] != self.plan_id
+                    or step < self.last_step or
+                    (not self.plan_interrupted and step > self.plan_start + 50)):
+                raise ValueError("Terminal snapshot must follow the final executed action")
+            state, batch = self._batch(payload)
+            with torch.no_grad(), self.lock, torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                raw = self.model.predict_action_chunk(batch, noise=self.noise).float()
+                boundary = self._encode(state, batch, raw)
+            if self.deferred_slice is not None:
+                if step != int(self.deferred_slice["step"]) or payload.get("actual"):
+                    raise ValueError("Terminal snapshot must close the staged parent window")
+                self._record_slice(self.deferred_slice, boundary)
+                self.deferred_slice = None
+            elif payload.get("actual"):
+                self._record_slice(payload, boundary, human=set(payload["sources"]) == {"HUMAN"})
+            else:
+                self.last_boundary, self.last_step = boundary, step
+            if self.transitions and self.transitions[-1].step_id + self.transitions[-1].executed_steps == step:
+                self.transitions[-1].next_ref_chunk = pad_chunk(raw[0].cpu().numpy(), 0)
+            self.pending_next_ref = None
+            self.plan_interrupted = True
             return {"req_id": req_id, "critical": self.critical,
                     "updates": self.trainer.updates if self.trainer else None}
         if command == "finish":
@@ -367,17 +418,58 @@ class Brain:
                 self.transitions.clear()
             elif self.trainer:
                 self.trainer.add_episode(episode, self.transitions, int(payload["reward"]))
-            self.episode, self.plan_id = None, None
-            self.transitions = []
-            self.pending_next_ref = None
-            self.plan_interrupted = False
-            self.human_reference = self.human_start_step = None
-            return {"req_id": req_id, "next_episode": self.trainer.episode+1 if self.trainer else episode + int(not payload.get("discard"))}
+            next_episode = self.trainer.episode + 1 if self.trainer else episode + int(not payload.get("discard"))
+            self.discard_active_episode()
+            return {"req_id": req_id, "next_episode": next_episode}
         raise ValueError("Unknown brain command")
+
+    def discard_active_episode(self):
+        """Forget an uncommitted episode after discard or client disconnect."""
+        self.episode = self.plan_id = self.plan_start = None
+        self.plan_actions = self.reference = self.raw_model_actions = None
+        self.last_boundary = self.last_step = None
+        self.critical, self.critical_since, self.detected_once = False, None, False
+        self.transitions = []
+        self.pending_next_ref = self.deferred_slice = None
+        self.plan_interrupted = False
+        self.human_reference = self.human_start_step = None
 
     def close(self):
         if self.trainer:
             self.trainer.close()
+
+
+def handle_client(brain, socket):
+    last_req = -1
+    claimed_episode = None
+    try:
+        for message in socket:
+            req_id = None
+            payload = None
+            try:
+                payload = unpack(message)
+                req_id = payload["req_id"]
+                if req_id <= last_req:
+                    raise ValueError("Requests must be strictly ordered on each connection")
+                last_req = req_id
+                if payload["command"] == "plan" and brain.episode is None:
+                    claimed_episode = int(payload["episode"])
+                reply = brain.handle(payload)
+                if payload["command"] == "finish":
+                    claimed_episode = None
+                reply["ok"] = True
+            except Exception as exc:
+                LOG.exception("Brain request failed")
+                if (payload is not None and payload.get("command") == "plan"
+                        and claimed_episode is not None and brain.episode == claimed_episode):
+                    brain.discard_active_episode()
+                    claimed_episode = None
+                reply = {"req_id": req_id, "ok": False, "error": str(exc)}
+            socket.send(pack(reply))
+    finally:
+        if claimed_episode is not None and brain.episode == claimed_episode:
+            LOG.warning("Discarding uncommitted episode %s after client disconnect", claimed_episode)
+            brain.discard_active_episode()
 
 
 def main():
@@ -387,22 +479,10 @@ def main():
     config = json.loads(args.config.read_text(encoding="utf-8"))
     logging.basicConfig(level=logging.INFO)
     brain = Brain(config)
+    client_lock = threading.Lock()
     def handler(socket):
-        last_req = -1
-        for message in socket:
-            req_id = None
-            try:
-                payload = unpack(message)
-                req_id = payload["req_id"]
-                if req_id <= last_req:
-                    raise ValueError("Requests must be strictly ordered on each connection")
-                last_req = req_id
-                reply = brain.handle(payload)
-                reply["ok"] = True
-            except Exception as exc:
-                LOG.exception("Brain request failed")
-                reply = {"req_id": req_id, "ok": False, "error": str(exc)}
-            socket.send(pack(reply))
+        with client_lock:
+            handle_client(brain, socket)
     with serve(handler, config.get("host", "127.0.0.1"), int(config.get("port", 6016)), max_size=MAX_MESSAGE_BYTES) as server:
         def shutdown(_signal, _frame):
             threading.Thread(target=server.shutdown, daemon=True).start()

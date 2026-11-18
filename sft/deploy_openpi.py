@@ -63,7 +63,7 @@ def load_env_file(path: Path) -> dict[str, str]:
     try:
         lines = path.read_text(encoding="utf-8-sig").splitlines()
     except UnicodeDecodeError:
-        lines = path.read_text(encoding="gbk").splitlines()
+        lines = path.read_text(encoding="gbk", errors="replace").splitlines()
     for raw_line in lines:
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -90,7 +90,10 @@ def build_parser() -> argparse.ArgumentParser:
     project_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
 
-    parser.add_argument("--env-file", type=Path, default=project_root / ".env")
+    default_env = project_root / ".env"
+    if not default_env.is_file():
+        default_env = project_root.parent / ".env"
+    parser.add_argument("--env-file", type=Path, default=default_env)
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--api-key", default=None)

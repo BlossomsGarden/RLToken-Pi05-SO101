@@ -145,6 +145,7 @@ class Stage2Trainer:
         self.warmup_episodes, self.actor_start_updates = warmup_episodes, actor_start_updates
         self.save_every = save_every
         self.episode = 0
+        self.episodes_completed = 0
         self.updates = 0
         self.worker_error = None
         if resume:
@@ -166,6 +167,9 @@ class Stage2Trainer:
         self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer"])
         self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
         self.updates, self.episode = int(checkpoint["total_updates"]), int(checkpoint["episode"])
+        self.episodes_completed = int(checkpoint.get("episodes_completed", len({
+            int(record["episode_id"]) for record in self.replay.records
+        })))
         self.replay.rng.bit_generator.state = checkpoint["replay_rng_state"]
         np.random.set_state(checkpoint["numpy_rng_state"])
         torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
@@ -184,13 +188,16 @@ class Stage2Trainer:
                 transitions[-1].rewards[transitions[-1].executed_steps - 1] = reward
                 transitions[-1].success = reward
                 self.replay.append_episode(transitions)
+                self.episodes_completed += 1
             self.episode = episode
-            if episode % self.save_every == 0:
+            if transitions and self.episodes_completed % self.save_every == 0:
                 self.save()
             with self.metrics.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"type": "episode", "episode": episode, "success": reward,
+                                         "episodes_completed": self.episodes_completed,
                                          "transitions": len(transitions), "replay": len(self.replay),
-                                         "updates": self.updates, "discard": not bool(transitions)}) + "\n")
+                                         "updates": self.updates, "has_replay": bool(transitions),
+                                         "discard": False}) + "\n")
 
     def save(self):
         with self.lock:
@@ -198,7 +205,8 @@ class Stage2Trainer:
             payload = {
                 "schema_version": 3, "actor_contract": "paper_full_output_v1", "rl_chunk_length": 10,
                 "action_space_contract": "openpi_delta_q01q99",
-                "episode": self.episode, "total_updates": self.updates,
+                "episode": self.episode, "episodes_completed": self.episodes_completed,
+                "total_updates": self.updates,
                 "actor_state_dict": self.actor.state_dict(), "actor_target_state_dict": self.target_actor.state_dict(),
                 "critic_state_dict": self.critic.state_dict(), "critic_target_state_dict": self.target_critic.state_dict(),
                 "actor_optimizer": self.actor_optimizer.state_dict(),
@@ -233,7 +241,8 @@ class Stage2Trainer:
     def _train_loop(self):
         try:
             while not self.stop_event.is_set():
-                if self.episode < self.warmup_episodes or not len(self.replay) or self.updates >= self.utd * self.replay.entries:
+                if (self.episodes_completed < self.warmup_episodes or len(self.replay) < self.batch_size
+                        or self.updates >= self.utd * self.replay.entries):
                     self.stop_event.wait(.05)
                     continue
                 with self.lock:

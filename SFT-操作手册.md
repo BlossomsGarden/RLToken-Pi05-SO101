@@ -51,7 +51,7 @@
 
 ## 🧪 SFT 配方
 
-以下是**原训练机记录的训练设置**；仓库内的 `sft/so101_config.py` 注册了配方、`sft/openpi_entry.py` 提供训练入口。原训练环境实际启动命令与私有权重还需在服务器核对。
+以下是本仓库采用的**独立 20k 步全量 SFT 配方**；`sft/so101_config.py` 注册配置，`sft/openpi_entry.py` 提供训练入口。当前 20k 配置保留，不按 OCR 报告中的另一训练进度修改衰减步数。
 
 | 模块 | 实际使用配置 |
 | --- | --- |
@@ -63,7 +63,7 @@
 
 **20k checkpoint** 是后续 Stage 3/4/5 冻结使用的 SFT 基础；10k 仅是训练耗时统计的单位，当前仓库没有可核验的 10k SFT 性能对照。Stage 3 的编码器训练、Stage 4 分类器训练与 SFT 全参数训练是不同步骤。
 
-训练配置名为 `pi05_so101_pickplace_v3`，配方见 [sft/so101_config.py](sft/so101_config.py)；[sft/openpi_entry.py](sft/openpi_entry.py) 负责在原 OpenPI 环境注册配置后调用其训练和统计脚本。训练所得归一化统计要与选用的 20k checkpoint **同源**，不能用原 LeRobot 数据集的绝对动作 q01/q99 代替 delta 动作统计。原机具体多卡启动命令请参阅 [待确认清单](需要进一步确定.md)。
+训练配置名为 `pi05_so101_pickplace_v3`，配方见 [sft/so101_config.py](sft/so101_config.py)；[sft/openpi_entry.py](sft/openpi_entry.py) 负责在原 OpenPI 环境注册配置后调用其训练和统计脚本。归一化统计要与选用的 20k checkpoint **同源**，不能用 LeRobot 数据集的绝对动作 q01/q99 代替 delta 动作统计。真机前需完成 [安全与性能验收](进一步确认的文档.md)。
 
 ## 👩‍🔬 分离式推理
 
@@ -130,7 +130,7 @@ python check_camera.py
 # 在当前目录生成 front.png、side.png；检查打印的索引与视角是否对应
 ```
 
-特别核实 `front` 是否是 SFT 对应的外置视角、`side` 是否是训练时腕部视角，**不要仅凭相机编号猜测**。
+训练时 **`front` 是外置相机**（`base_0_rgb`），**`side` 是腕部相机**（`left_wrist_0_rgb`）。每次插拔 USB 后序号可能重排，仍须打开 `front.png`、`side.png` 与训练帧实拍核对，不能只相信设备编号。
 
 ### 4️⃣ 先 dry-run，再执行
 
@@ -154,4 +154,4 @@ python deploy_openpi.py --no-calibration --jpeg-quality 90 --steps 1500 --execut
 
 - 用户提供的原机记录：PyTorch fp32 约 22 GB／184 ms；JAX fp16 约 8.8 GB／85 ms；相机读数/编码约 10 ms、网络估计约 20 ms、返回动作约 5 ms，合计约 120 ms。**这些并非本仓库或当前隧道复测值**。
 - 50 步、30 fps 的一块覆盖约 1.67 s；整体停顿还受 `settle` 影响。现有 SFT 客户端在下一次抓拍前要求连续 **4 次**、每次间隔约 **50 ms** 的关节运动不超过 0.5°；实际端到端时间需看日志和真机测量。
-- 机械臂发生跟踪误差、夹爪打滑或镜头错位时，停止执行并复核安全阈值、标定和映射。现有疑问及需补测的数值见 [需要进一步确定](需要进一步确定.md)。
+- 机械臂发生跟踪误差、夹爪打滑或镜头错位时，停止执行并复核安全阈值、标定和映射。待做的本地实测见 [安全与性能验收](进一步确认的文档.md)。

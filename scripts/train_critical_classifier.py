@@ -101,7 +101,9 @@ def sample_dataset_frames(
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     rng = random.Random(seed)
-    ds = LeRobotDataset(repo_id=dataset_path)
+    local_root = Path(dataset_path)
+    ds = (LeRobotDataset(repo_id=local_root.name, root=local_root) if local_root.is_dir()
+          else LeRobotDataset(repo_id=dataset_path))
     episode_ids = np.asarray(ds.hf_dataset["episode_index"], dtype=np.int64)
     frame_ids = np.asarray(ds.hf_dataset["frame_index"], dtype=np.int64)
     if len(episode_ids) != ds.num_frames:

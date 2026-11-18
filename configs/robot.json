@@ -18,11 +18,10 @@
     "side": {"index_or_path": 0, "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG", "warmup_s": 3}
   },
   "max_relative_target": 15.0,
-  "max_leader_alignment_deg": 10.0,
   "max_tracking_error_deg": [27, 37, 45, 29, 10, 30],
   "max_command_step_deg": [5, 7, 7.5, 4.5, 1.25, 6.5],
-  "settle_tolerance_deg": [2, 2, 2, 2, 2, 4],
-  "settle_timeout_s": 0.5,
+  "settle_tolerance_deg": [0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+  "settle_timeout_s": 2.0,
   "gripper_hold": {
     "min_deg": 5.0,
     "current_threshold_raw": 180,

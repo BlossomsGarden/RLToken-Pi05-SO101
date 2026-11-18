@@ -508,8 +508,13 @@ __all__ = [
 def openpi_quantiles(path: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Read the SFT checkpoint's state and delta-action statistics."""
     stats = json.loads(Path(path).read_text(encoding="utf-8"))
-    result = tuple(np.asarray(stats[name][key], dtype=np.float32)
-                   for name in ("state", "actions") for key in ("q01", "q99"))
+    stats = stats.get("norm_stats", stats)
+    state = stats.get("state", stats.get("observation.state"))
+    actions = stats.get("actions", stats.get("action"))
+    if not isinstance(state, dict) or not isinstance(actions, dict):
+        raise ValueError("OpenPI stats require state/actions or observation.state/action quantiles")
+    result = tuple(np.asarray(section[key], dtype=np.float32)
+                   for section in (state, actions) for key in ("q01", "q99"))
     if any(x.shape != (6,) or not np.isfinite(x).all() for x in result):
         raise ValueError("Expected finite six-joint OpenPI state/actions quantiles")
     if np.any(result[1] <= result[0]) or np.any(result[3] <= result[2]):
