@@ -2,12 +2,15 @@
 
 **目标：**用四种颜色组合的 120 集示范训练 π0.5，再针对**红块叠绿块并对齐**，在 SO-101 上进行 RLToken 的人工介入在线训练。Windows 控制真机；Linux GPU 运行推理与学习。
 
-| SFT vs RLT | SFT (OOD Position)<br>抬起不够高、放置不稳 | RLT<br>Human-In-Loop | RLT 推理<br>足够高、对齐后放置 |
+| SFT vs RLT | SFT (OOD Position)<br>抬起不够高、放不稳、松开碰掉 | RLT<br>Human-In-Loop | RLT 推理<br>足够高、对齐后放置 |
 | :---: | :---: | :---: | :---: |
 | <img src="assets/sft-rlt.png" height="148" alt="SFT 与 RLToken 叠放对比"> | <img src="assets/sft-bad-1.gif" height="148" alt="新方块位置下 SFT 动作迟疑"> | <img src="assets/rlt-train.gif" height="148" alt="在线训练中主臂人工介入及早期 Actor 抖动"> | <img src="assets/rlt-infer.gif" height="148" alt="RLToken 推理中空中旋转并对齐叠放"> |
 
 pick-and-place 成功率：**全量SFT** 76.7% (23/30)；**lora全量微调** 80% (24/30)；**仅action expert训练** 10% (3/30)。
-place 时完美对齐率：**全量SFT** 偶然 6.7% (23/30)；**RL-Token** 76.7% (23/30) 且仍具备未见颜色组合的泛化能力。
+place 时完美对齐率：**全量SFT** 偶然 6.7% (23/30)；**RL-Token** 76.7% (23/30) 。
+
+SFT 训练时红绿黄的方块同时存在，仅使用4种颜色组合，测试时确认模型学到另两种颜色组合的泛化性。
+RLToken 在单颜色组合任务训练后，仍然能够保其他颜色组合的泛化性（但三色方块共存时偶尔会放错方块）。
 
 ## 🗺️ 一图看懂五阶段
 
